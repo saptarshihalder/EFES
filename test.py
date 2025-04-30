@@ -1,7 +1,3 @@
-# -----------------------------------------------------
-# 15. Training and Initialization Functions
-# -----------------------------------------------------
-
 def initialize_coupled_system(
     matter_type: str,
     matter_params: Dict[str, Any],
@@ -253,11 +249,6 @@ def run_coupled_training(
             st.plotly_chart(history_fig)
     
     return history
-
-
-# -----------------------------------------------------
-# 16. Main Application
-# -----------------------------------------------------
 
 def main():
     """Main function for the Streamlit app."""
@@ -1302,10 +1293,6 @@ class GravitationalSystem:
         return history
 
 
-# -----------------------------------------------------
-# 13. Visualization Functions for Matter Distributions
-# -----------------------------------------------------
-
 def visualize_matter_density(
     grav_system: GravitationalSystem,
     t_value: float,
@@ -1638,9 +1625,7 @@ def visualize_fluid_flow(
     t_value: float,
     slice_axis: int = 3,
     slice_value: float = 0.0,
-    matter_index: int = 0,# -----------------------------------------------------
-# 8. Enhanced Matter Coupling for Advanced Physical Models
-# -----------------------------------------------------
+    matter_index: int = 0,
 
 class MatterModel(nn.Module):
     """Base class for matter field models that couple to spacetime geometry.
@@ -2414,7 +2399,7 @@ class DarkSectorMatter(MatterModel):
 
 
 # -----------------------------------------------------
-# 11. Run the application
+#  Run the application
 # -----------------------------------------------------
 
 if __name__ == "__main__":
@@ -3710,9 +3695,8 @@ def plot_training_history(history: Dict[str, List[float]]) -> go.Figure:
     return fig
 
 
-# -----------------------------------------------------
-# 8. Example Stress-Energy Tensors for Matter Coupling
-# -----------------------------------------------------
+# Stress-Energy Tensors for Matter Coupling
+
 
 def dust_stress_energy(
     coords: torch.Tensor,
