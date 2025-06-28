@@ -11,70 +11,78 @@ from matplotlib import cm
 from mpl_toolkits.mplot3d import Axes3D
 
 # Tensor calculus functions for Einstein Field Equations
-def compute_christoffel_symbols(g, g_inv, coords):
+def compute_christoffel_symbols(g, g_inv, coords, metric_model):
     """
-    Compute Christoffel symbols using automatic differentiation.
+    Compute Christoffel symbols using finite difference approximation.
     Γ^k_ij = (1/2) g^kl (∂_i g_jl + ∂_j g_il - ∂_l g_ij)
+    
+    Args:
+        g: Metric tensor at original coordinates
+        g_inv: Inverse metric tensor at original coordinates
+        coords: Spacetime coordinates
+        metric_model: Neural network model that computes the metric
     """
     batch_size = coords.shape[0]
     device = coords.device
     
-    # Enable gradient tracking for coordinates
-    coords.requires_grad_(True)
-    
     # Initialize Christoffel symbols tensor
     christoffel = torch.zeros(batch_size, 4, 4, 4, device=device)
     
-    # For a simplified approach that will work with any batch size, we'll use a numerical approximation
-    epsilon = 1e-4
+    # For numerical stability, use an adaptive epsilon based on coordinate scale
+    coord_scale = torch.mean(torch.abs(coords[:, 1:]))  # Use spatial coordinates for scale
+    epsilon = max(1e-4 * coord_scale, 1e-6)  # Prevent too small epsilon
     
     for mu in range(4):
         for i in range(4):
             for j in range(4):
-                # Use a simplified numerical differentiation approach
                 for l in range(4):
                     for b in range(batch_size):
                         # Compute partial derivatives using finite differences
-                        dx_plus = torch.zeros_like(coords)
-                        dx_minus = torch.zeros_like(coords)
+                        if i == 0:  # Time derivative needs special handling
+                            # We approximate time derivatives as small or zero for static metrics
+                            dg_i = torch.zeros_like(g[b])
+                        else:
+                            # Perturb coordinates in i direction
+                            coords_plus = coords.clone()
+                            coords_minus = coords.clone()
+                            coords_plus[b, i] += epsilon
+                            coords_minus[b, i] -= epsilon
+                            
+                            # Evaluate metric at perturbed points
+                            with torch.no_grad():
+                                g_plus = metric_model(coords_plus).reshape(-1, 4, 4)[b]
+                                g_minus = metric_model(coords_minus).reshape(-1, 4, 4)[b]
+                                dg_i = (g_plus - g_minus) / (2 * epsilon)
                         
-                        # Small perturbation in coordinate direction i
-                        dx_plus[b, i] = epsilon
-                        dx_minus[b, i] = -epsilon
+                        if j == 0:  # Time derivative
+                            dg_j = torch.zeros_like(g[b])
+                        else:
+                            # Perturb coordinates in j direction
+                            coords_plus = coords.clone()
+                            coords_minus = coords.clone()
+                            coords_plus[b, j] += epsilon
+                            coords_minus[b, j] -= epsilon
+                            
+                            # Evaluate metric at perturbed points
+                            with torch.no_grad():
+                                g_plus = metric_model(coords_plus).reshape(-1, 4, 4)[b]
+                                g_minus = metric_model(coords_minus).reshape(-1, 4, 4)[b]
+                                dg_j = (g_plus - g_minus) / (2 * epsilon)
                         
-                        # Get metric at perturbed points
-                        with torch.no_grad():
-                            g_plus = g.clone()
-                            g_minus = g.clone()
+                        if l == 0:  # Time derivative
+                            dg_l = torch.zeros_like(g[b])
+                        else:
+                            # Perturb coordinates in l direction
+                            coords_plus = coords.clone()
+                            coords_minus = coords.clone()
+                            coords_plus[b, l] += epsilon
+                            coords_minus[b, l] -= epsilon
                             
-                            if i == 0:  # Time derivative needs special handling
-                                # We approximate time derivatives as small or zero for static metrics
-                                dg_i = torch.zeros_like(g[b])
-                            else:
-                                # Finite difference for spatial derivatives
-                                dg_i = (g_plus[b] - g_minus[b]) / (2 * epsilon)
-                            
-                            # Same for derivative in j direction
-                            dx_plus = torch.zeros_like(coords)
-                            dx_minus = torch.zeros_like(coords)
-                            dx_plus[b, j] = epsilon
-                            dx_minus[b, j] = -epsilon
-                            
-                            if j == 0:  # Time derivative
-                                dg_j = torch.zeros_like(g[b])
-                            else:
-                                dg_j = (g_plus[b] - g_minus[b]) / (2 * epsilon)
-                            
-                            # And for l direction
-                            dx_plus = torch.zeros_like(coords)
-                            dx_minus = torch.zeros_like(coords)
-                            dx_plus[b, l] = epsilon
-                            dx_minus[b, l] = -epsilon
-                            
-                            if l == 0:  # Time derivative
-                                dg_l = torch.zeros_like(g[b])
-                            else:
-                                dg_l = (g_plus[b] - g_minus[b]) / (2 * epsilon)
+                            # Evaluate metric at perturbed points
+                            with torch.no_grad():
+                                g_plus = metric_model(coords_plus).reshape(-1, 4, 4)[b]
+                                g_minus = metric_model(coords_minus).reshape(-1, 4, 4)[b]
+                                dg_l = (g_plus - g_minus) / (2 * epsilon)
                         
                         # Compute Christoffel symbol components
                         christoffel[b, mu, i, j] += 0.5 * g_inv[b, mu, l] * (
@@ -155,19 +163,22 @@ def compute_ricci_scalar(ricci, g_inv):
     
     return ricci_scalar
 
-def compute_einstein_tensor(g, g_inv, coords):
+def compute_einstein_tensor(g, g_inv, coords, metric_model):
     """
     Compute the Einstein tensor G_μν = R_μν - (1/2)Rg_μν
     
-    For testing purposes, this uses simplified calculations that may not be
-    fully accurate but will allow the code to run and demonstrate functionality.
+    Args:
+        g: Metric tensor
+        g_inv: Inverse metric tensor
+        coords: Spacetime coordinates
+        metric_model: Neural network model that computes the metric
     """
     batch_size = coords.shape[0]
     device = coords.device
     
     try:
         # Compute Christoffel symbols
-        christoffel = compute_christoffel_symbols(g, g_inv, coords)
+        christoffel = compute_christoffel_symbols(g, g_inv, coords, metric_model)
         
         # Compute Riemann tensor
         riemann = compute_riemann_tensor(christoffel, coords)
@@ -214,6 +225,10 @@ def compute_einstein_tensor(g, g_inv, coords):
 def compute_efe_loss(coords, grav_system):
     """
     Compute loss based on Einstein Field Equations: G_μν = 8πT_μν
+    
+    Args:
+        coords: Spacetime coordinates
+        grav_system: GravitationalSystem instance containing metric and matter models
     """
     try:
         # Enable gradient tracking
@@ -224,7 +239,7 @@ def compute_efe_loss(coords, grav_system):
         g_inv = torch.inverse(g)
         
         # Compute Einstein tensor
-        G_tensor = compute_einstein_tensor(g, g_inv, coords)
+        G_tensor = compute_einstein_tensor(g, g_inv, coords, grav_system.metric_model)
         
         # Compute stress-energy tensor
         T_tensor = grav_system.combined_stress_energy(coords, g, g_inv)
