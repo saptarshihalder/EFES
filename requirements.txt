@@ -1,0 +1,22 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.6.0
+
+# Testing dependencies
+pytest>=7.2.0
+pytest-cov>=4.0.0
+
+# Optional visualization dependencies (if we add visualization module)
+seaborn>=0.12.0
+plotly>=5.13.0
+
+# Development dependencies
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0
+isort>=5.12.0
+
+# Documentation dependencies (optional)
+sphinx>=5.3.0
+sphinx-rtd-theme>=1.2.0
