@@ -1,48 +1,16 @@
-"""
-EFES Main Module (Single File)
-
-This file merges the entire EFES package into a standalone script.
-"""
+"""Unified EFES module."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import time
 
-"""
-Vectorized tensor calculus operations for Einstein Field Equations.
-
-This module implements highly optimized, fully vectorized operations for computing
-geometric quantities in General Relativity, including:
-- Christoffel symbols
-- Riemann curvature tensor
-- Ricci tensor and scalar
-- Einstein tensor
-
-All operations are implemented using PyTorch's vectorized operations, avoiding
-explicit loops for improved performance on GPUs.
-
-Physics Approximations:
-----------------------
-1. Numerical Derivatives: We use finite differences with adaptive step sizes
-   for computing metric derivatives. This approximation is valid when the
-   metric varies smoothly on scales larger than the step size.
-   
-2. Static Metric Approximation: For time derivatives (∂_t), we currently assume
-   a static or slowly varying metric. This is valid for:
-   - Schwarzschild spacetime
-   - Slowly rotating Kerr spacetime
-   - Cosmological solutions with slow time evolution
-   
-3. Coordinate Singularity Handling: Near coordinate singularities (e.g., r=2M
-   in Schwarzschild coordinates), we apply regularization to avoid numerical
-   instabilities. This does not affect the physical predictions away from
-   these regions.
-"""
+"""Vectorized tensor calculus for Einstein's equations."""
 
 import torch
 import torch.nn.functional as F
@@ -3082,7 +3050,7 @@ class GravitationalSystem:
             g = 0.5 * (g + g.transpose(-2, -1))
             return g
     
-    def predict_curvature(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
+def predict_curvature(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Predict curvature quantities at given coordinates."""
         from __main__ import (
             compute_einstein_tensor_vectorized,
@@ -3096,14 +3064,31 @@ class GravitationalSystem:
                 g, coords, self.metric_model, tensor_config, return_components=True
             )
             kretschmann = compute_kretschmann_scalar(components["riemann"])
-            return {
-                "einstein_tensor": components["einstein"],
-                "ricci_tensor": components["ricci"],
-                "ricci_scalar": components["ricci_scalar"],
-                "riemann_tensor": components["riemann"],
-                "kretschmann_scalar": kretschmann
-            }
+        return {
+            "einstein_tensor": components["einstein"],
+            "ricci_tensor": components["ricci"],
+            "ricci_scalar": components["ricci_scalar"],
+            "riemann_tensor": components["riemann"],
+            "kretschmann_scalar": kretschmann
+        }
 
+
+
+# Plot training loss curves
+def plot_training_history(history: Dict[str, List[float]], filename: str = "training_history.png"):
+    """Plot training history to a PNG file."""
+    epochs = range(1, len(history.get("total_loss", [])) + 1)
+    plt.figure()
+    if "total_loss" in history:
+        plt.plot(epochs, history["total_loss"], label="total")
+    if "efe_loss" in history:
+        plt.plot(epochs, history["efe_loss"], label="efe")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
 
 
 # Example usage
@@ -3117,6 +3102,7 @@ def run_example():
     system = GravitationalSystem(metric_model, [matter])
 
     history = system.train(epochs=20, batch_size=64)
+    plot_training_history(history)
 
     coords = torch.tensor([[0.0, 5.0, 0.0, 0.0],
                            [0.0, 10.0, 0.0, 0.0]])
