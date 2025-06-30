@@ -1,4 +1,3 @@
-"""Unified EFES module."""
 
 import torch
 import torch.nn as nn
@@ -10,7 +9,6 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import time
 
-"""Vectorized tensor calculus for Einstein's equations."""
 
 import torch
 import torch.nn.functional as F
@@ -19,23 +17,19 @@ from dataclasses import dataclass
 
 
 class TensorOpsError(Exception):
-    """Base exception for tensor operations errors."""
     pass
 
 
 class MetricSingularityError(TensorOpsError):
-    """Raised when metric becomes singular or non-invertible."""
     pass
 
 
 class NumericalInstabilityError(TensorOpsError):
-    """Raised when numerical instabilities are detected."""
     pass
 
 
 @dataclass
 class TensorConfig:
-    """Configuration for tensor operations."""
     epsilon: float = 1e-6  # Numerical regularization parameter
     derivative_epsilon: float = 1e-4  # Step size for finite differences
     max_christoffel_norm: float = 1e6  # Maximum allowed norm for Christoffel symbols
@@ -44,7 +38,6 @@ class TensorConfig:
 
 
 def safe_inverse(matrix: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    """Compute regularized matrix inverse."""
     try:
         # Add small identity matrix for regularization
         batch_shape = matrix.shape[:-2]
@@ -75,7 +68,6 @@ def compute_metric_derivatives_vectorized(
     metric_func: Optional[torch.nn.Module] = None,
     config: Optional[TensorConfig] = None
 ) -> torch.Tensor:
-    """Vectorized metric derivatives."""
     if config is None:
         config = TensorConfig()
         
@@ -127,7 +119,6 @@ def _compute_metric_derivatives_autodiff(
     coords: torch.Tensor,
     metric_func: torch.nn.Module
 ) -> torch.Tensor:
-    """Helper function to compute metric derivatives using automatic differentiation."""
     batch_size = coords.shape[0]
     device = coords.device
     
@@ -168,7 +159,6 @@ def compute_christoffel_symbols_vectorized(
     metric_func: Optional[torch.nn.Module] = None,
     config: Optional[TensorConfig] = None
 ) -> torch.Tensor:
-    """Vectorized Christoffel symbols."""
     if config is None:
         config = TensorConfig()
     
@@ -221,7 +211,6 @@ def compute_riemann_tensor_vectorized(
     coords: Optional[torch.Tensor] = None,
     config: Optional[TensorConfig] = None
 ) -> torch.Tensor:
-    """Vectorized Riemann tensor."""
     if config is None:
         config = TensorConfig()
     
@@ -256,7 +245,6 @@ def compute_riemann_tensor_vectorized(
 
 
 def compute_ricci_tensor_vectorized(riemann: torch.Tensor) -> torch.Tensor:
-    """Contract Riemann tensor to Ricci tensor."""
     # Contract first and third indices: R_μν = R^λ_μλν
     # riemann shape: [batch, ρ, σ, μ, ν]
     # We want: R^λ_μλν, so contract indices 0 and 2
@@ -274,7 +262,6 @@ def compute_ricci_scalar_vectorized(
     ricci: torch.Tensor,
     g_inv: torch.Tensor
 ) -> torch.Tensor:
-    """Compute Ricci scalar."""
     # Contract Ricci tensor with inverse metric
     ricci_scalar = torch.einsum('...ij,...ij->...', g_inv, ricci)
     
@@ -288,7 +275,6 @@ def compute_einstein_tensor_vectorized(
     config: Optional[TensorConfig] = None,
     return_components: bool = False
 ) -> torch.Tensor:
-    """Vectorized Einstein tensor."""
     if config is None:
         config = TensorConfig()
     
@@ -343,7 +329,6 @@ def _approximate_einstein_tensor(
     coords: torch.Tensor,
     config: TensorConfig
 ) -> torch.Tensor:
-    """Approximate Einstein tensor."""
     batch_size = coords.shape[0]
     device = coords.device
     
@@ -365,16 +350,6 @@ def _approximate_einstein_tensor(
 
 
 def compute_kretschmann_scalar(riemann: torch.Tensor) -> torch.Tensor:
-    """
-    Compute the Kretschmann scalar K = R^μνρσ R_μνρσ.
-    
-    Args:
-        riemann: Riemann tensor [batch_size, 4, 4, 4, 4]
-        
-    Returns:
-        Kretschmann scalar [batch_size]
-        
-    """
     # Contract all indices: K = R^μνρσ R_μνρσ
     kretschmann = torch.einsum('...ijkl,...ijkl->...', riemann, riemann)
     
@@ -386,7 +361,6 @@ def check_energy_conditions(
     g: torch.Tensor,
     g_inv: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
-    """Check stress-energy energy conditions."""
     batch_size = T.shape[0]
     device = T.device
     
@@ -426,18 +400,6 @@ def check_energy_conditions(
         'strong': sec,
         'dominant': dec
     }
-"""
-Neural network models for Einstein Field Equations Solver.
-
-This module implements various neural network architectures for learning
-spacetime metrics and matter fields, including:
-- SIREN (Sinusoidal Representation Networks)
-- Fourier Feature Networks
-- Physics-informed neural networks
-
-The models are designed to respect the symmetries and constraints of
-General Relativity.
-"""
 
 import torch
 import torch.nn as nn
@@ -448,18 +410,15 @@ from dataclasses import dataclass
 
 
 class ModelError(Exception):
-    """Base exception for model-related errors."""
     pass
 
 
 class InitializationError(ModelError):
-    """Raised when model initialization fails."""
     pass
 
 
 @dataclass
 class ModelConfig:
-    """Configuration for neural network models."""
     hidden_features: int = 128
     hidden_layers: int = 4
     activation: str = "sine"
@@ -473,10 +432,6 @@ class ModelConfig:
 
 
 class Sine(nn.Module):
-    """
-    Sine activation function for SIREN networks.
-    
-    """
     
     def __init__(self, omega: float = 30.0, learnable: bool = False):
         super().__init__()
@@ -490,10 +445,6 @@ class Sine(nn.Module):
 
 
 class FourierFeatures(nn.Module):
-    """
-    Random Fourier features for improved representation of high-frequency functions.
-    
-    """
     
     def __init__(self, in_features: int, num_frequencies: int = 128, 
                  scale: float = 10.0, learnable: bool = False):
@@ -516,22 +467,6 @@ class FourierFeatures(nn.Module):
 
 
 class SIREN(nn.Module):
-    """
-    SIREN (Sinusoidal Representation Networks) model.
-    
-    SIREN networks use periodic activations and special initialization to
-    learn smooth implicit representations of functions.
-    
-    Reference: Sitzmann et al., "Implicit Neural Representations with 
-    Periodic Activation Functions", NeurIPS 2020
-    
-    Physics Application:
-    --------------------
-    SIREN is particularly effective for learning metric tensors because:
-    1. The sine activation naturally produces smooth functions
-    2. Derivatives of the network remain well-behaved
-    3. The network can represent both low and high frequency components
-    """
     
     def __init__(self, config: ModelConfig, in_features: int, out_features: int):
         super().__init__()
@@ -630,18 +565,6 @@ class SIREN(nn.Module):
 
 
 class MetricNet(nn.Module):
-    """
-    Neural network for learning spacetime metric tensors.
-    
-    This network learns a function from spacetime coordinates to metric
-    components, with built-in constraints to ensure physical validity.
-    
-    Physics Constraints:
-    -------------------
-    1. Symmetry: g_μν = g_νμ (enforced by construction)
-    2. Signature: The metric should have Lorentzian signature (-,+,+,+)
-    3. Smoothness: The metric should be at least C² for well-defined curvature
-    """
     
     def __init__(self, config: Optional[ModelConfig] = None, 
                  enforce_symmetry: bool = True,
@@ -667,15 +590,6 @@ class MetricNet(nn.Module):
             self.space_scale = nn.Parameter(torch.tensor(1.0))
     
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass: coordinates -> metric tensor.
-        
-        Args:
-            coords: Spacetime coordinates [batch_size, 4]
-            
-        Returns:
-            Metric tensor [batch_size, 16] (flattened 4x4 matrix)
-        """
         # Get raw output from SIREN
         metric_raw = self.siren(coords)
         
@@ -709,19 +623,12 @@ class MetricNet(nn.Module):
         return metric.reshape(batch_size, 16)
     
     def get_metric_tensor(self, coords: torch.Tensor) -> torch.Tensor:
-        """Get metric as a proper 4x4 tensor."""
         metric_flat = self.forward(coords)
         batch_size = coords.shape[0]
         return metric_flat.reshape(batch_size, 4, 4)
 
 
 class FourierNet(nn.Module):
-    """
-    Neural network using Fourier features for high-frequency function learning.
-    
-    This architecture is useful when the metric has rapid spatial variations,
-    such as near black hole horizons or in strong-field regions.
-    """
     
     def __init__(self, config: Optional[ModelConfig] = None,
                  in_features: int = 4, out_features: int = 16,
@@ -765,16 +672,6 @@ class FourierNet(nn.Module):
 
 
 class PhysicsInformedNet(nn.Module):
-    """
-    Physics-informed neural network that incorporates physical constraints
-    directly into the architecture.
-    
-    This network includes:
-    1. Symmetry constraints
-    2. Conservation laws
-    3. Asymptotic behavior
-    
-    """
     
     def __init__(self, config: Optional[ModelConfig] = None,
                  symmetry_type: str = "spherical",
@@ -802,7 +699,6 @@ class PhysicsInformedNet(nn.Module):
         self.decay_rate = nn.Parameter(torch.tensor(1.0))
     
     def enforce_symmetry(self, coords: torch.Tensor, metric: torch.Tensor) -> torch.Tensor:
-        """Enforce symmetry constraints based on symmetry type."""
         batch_size = coords.shape[0]
         
         if self.symmetry_type == "spherical":
@@ -819,7 +715,6 @@ class PhysicsInformedNet(nn.Module):
         return metric
     
     def apply_asymptotic_behavior(self, coords: torch.Tensor, metric: torch.Tensor) -> torch.Tensor:
-        """Apply asymptotic boundary conditions."""
         batch_size = coords.shape[0]
         
         # Compute distance from origin
@@ -857,20 +752,6 @@ class PhysicsInformedNet(nn.Module):
 def create_metric_model(model_type: str = "siren", 
                        config: Optional[ModelConfig] = None,
                        **kwargs) -> nn.Module:
-    """
-    Factory function to create metric models.
-    
-    Args:
-        model_type: Type of model ("siren", "fourier", "physics_informed")
-        config: Model configuration
-        **kwargs: Additional arguments for specific models
-        
-    Returns:
-        Neural network model
-        
-    Raises:
-        ValueError: If model_type is not recognized
-    """
     if config is None:
         config = ModelConfig()
     
@@ -882,20 +763,6 @@ def create_metric_model(model_type: str = "siren",
         return PhysicsInformedNet(config, **kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-"""
-Matter models for Einstein Field Equations Solver.
-
-This module implements various matter and energy sources that contribute
-to the stress-energy tensor in Einstein's field equations, including:
-- Perfect fluids
-- Scalar fields
-- Electromagnetic fields
-- Dark matter and dark energy
-
-Each matter model computes its contribution to the stress-energy tensor
-T_μν, which appears on the right-hand side of Einstein's equations.
-
-"""
 
 import torch
 import torch.nn as nn
@@ -910,23 +777,19 @@ from abc import ABC, abstractmethod
 
 
 class MatterError(Exception):
-    """Base exception for matter model errors."""
     pass
 
 
 class ConservationViolationError(MatterError):
-    """Raised when stress-energy conservation is violated."""
     pass
 
 
 class EnergyConditionError(MatterError):
-    """Raised when energy conditions are violated."""
     pass
 
 
 @dataclass
 class MatterConfig:
-    """Configuration for matter models."""
     hidden_dim: int = 64
     activation: str = "sine"
     enforce_conservation: bool = True
@@ -935,14 +798,6 @@ class MatterConfig:
 
 
 class MatterModel(nn.Module, ABC):
-    """
-    Abstract base class for all matter models.
-    
-    Each matter model must implement:
-    1. get_stress_energy: Compute the stress-energy tensor
-    2. get_field_values: Return physical field values
-    3. compute_conservation: Check conservation laws
-    """
     
     def __init__(self, config: Optional[MatterConfig] = None):
         super().__init__()
@@ -966,30 +821,10 @@ class MatterModel(nn.Module, ABC):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute the stress-energy tensor for this matter type.
-        
-        Args:
-            coords: Spacetime coordinates [batch_size, 4]
-            g: Metric tensor [batch_size, 4, 4]
-            g_inv: Inverse metric [batch_size, 4, 4]
-            
-        Returns:
-            Stress-energy tensor [batch_size, 4, 4]
-        """
         pass
     
     @abstractmethod
     def get_field_values(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Get physical field values (density, pressure, etc.).
-        
-        Args:
-            coords: Spacetime coordinates [batch_size, 4]
-            
-        Returns:
-            Dictionary of field values
-        """
         pass
     
     def compute_conservation(
@@ -998,21 +833,6 @@ class MatterModel(nn.Module, ABC):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute the conservation equation ∇_μ T^μν = 0.
-        
-        This is a fundamental requirement for any physical stress-energy tensor,
-        following from the contracted Bianchi identity and Einstein's equations.
-        
-        Args:
-            coords: Spacetime coordinates [batch_size, 4]
-            g: Metric tensor [batch_size, 4, 4]
-            g_inv: Inverse metric [batch_size, 4, 4]
-            
-        Returns:
-            Conservation violation [batch_size, 4]
-            
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1051,24 +871,6 @@ class MatterModel(nn.Module, ABC):
 
 
 class PerfectFluidMatter(MatterModel):
-    """
-    Perfect fluid matter model.
-    
-    A perfect fluid is characterized by:
-    - Energy density ρ
-    - Pressure p
-    - Four-velocity u^μ (normalized: g_μν u^μ u^ν = -1)
-    
-    The stress-energy tensor is:
-    T_μν = (ρ + p) u_μ u_ν + p g_μν
-    
-    Physics Applications:
-    --------------------
-    - Cosmological models (radiation, matter, dark energy)
-    - Stellar interiors
-    - Accretion disks
-    - Early universe physics
-    """
     
     def __init__(
         self, 
@@ -1102,10 +904,6 @@ class PerfectFluidMatter(MatterModel):
             self.Gamma = nn.Parameter(torch.tensor(eos_params.get("Gamma", 5/3)))
     
     def equation_of_state(self, density: torch.Tensor) -> torch.Tensor:
-        """
-        Compute pressure from density using equation of state.
-        
-        """
         if self.eos_type == "linear":
             return self.w * density
         elif self.eos_type == "polytropic":
@@ -1114,7 +912,6 @@ class PerfectFluidMatter(MatterModel):
             raise ValueError(f"Unknown EOS type: {self.eos_type}")
     
     def get_density(self, coords: torch.Tensor) -> torch.Tensor:
-        """Get energy density at given coordinates."""
         # Ensure positive density
         raw_density = self.density_net(coords)
         return F.softplus(raw_density) + 1e-6
@@ -1125,11 +922,6 @@ class PerfectFluidMatter(MatterModel):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Get normalized four-velocity.
-        
-        The four-velocity must satisfy g_μν u^μ u^ν = -1.
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1156,11 +948,6 @@ class PerfectFluidMatter(MatterModel):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute perfect fluid stress-energy tensor.
-        
-        T_μν = (ρ + p) u_μ u_ν + p g_μν
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1190,7 +977,6 @@ class PerfectFluidMatter(MatterModel):
         return T
     
     def get_field_values(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Get physical field values."""
         density = self.get_density(coords)
         pressure = self.equation_of_state(density)
         
@@ -1202,18 +988,6 @@ class PerfectFluidMatter(MatterModel):
 
 
 class ScalarFieldMatter(MatterModel):
-    """
-    Scalar field matter model.
-    
-    Scalar fields are fundamental in:
-    - Inflation models
-    - Dark energy (quintessence)
-    - Higgs mechanism
-    - Axion dark matter
-    
-    The stress-energy tensor for a scalar field φ with potential V(φ) is:
-    T_μν = ∂_μφ ∂_νφ - g_μν [½ g^αβ ∂_αφ ∂_βφ + V(φ)]
-    """
     
     def __init__(
         self,
@@ -1253,10 +1027,6 @@ class ScalarFieldMatter(MatterModel):
             self.alpha = nn.Parameter(torch.tensor(coupling_params.get("alpha", 1.0)))
     
     def potential(self, phi: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the scalar field potential V(φ).
-        
-        """
         if self.complex_field:
             # For complex field, use |φ|² = φ*φ
             phi_sq = (phi[..., 0]**2 + phi[..., 1]**2)
@@ -1273,7 +1043,6 @@ class ScalarFieldMatter(MatterModel):
             raise ValueError(f"Unknown potential type: {self.potential_type}")
     
     def get_field(self, coords: torch.Tensor) -> torch.Tensor:
-        """Get scalar field value at given coordinates."""
         return self.field_net(coords)
     
     def get_stress_energy(
@@ -1282,11 +1051,6 @@ class ScalarFieldMatter(MatterModel):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute scalar field stress-energy tensor.
-        
-        T_μν = ∂_μφ ∂_νφ - g_μν [½ g^αβ ∂_αφ ∂_βφ + V(φ)]
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1350,7 +1114,6 @@ class ScalarFieldMatter(MatterModel):
         return T
     
     def get_field_values(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Get physical field values."""
         phi = self.get_field(coords)
         V = self.potential(phi)
         
@@ -1362,21 +1125,6 @@ class ScalarFieldMatter(MatterModel):
 
 
 class ElectromagneticFieldMatter(MatterModel):
-    """
-    Electromagnetic field matter model.
-    
-    The electromagnetic field is described by the field tensor F_μν and
-    contributes to spacetime curvature through its stress-energy tensor:
-    
-    T_μν = 1/μ₀ [F_μα F_ν^α - ¼ g_μν F_αβ F^αβ]
-    
-    Physics Applications:
-    --------------------
-    - Charged black holes (Reissner-Nordström)
-    - Magnetized neutron stars
-    - Cosmological magnetic fields
-    - Plasma dynamics in curved spacetime
-    """
     
     def __init__(
         self,
@@ -1402,7 +1150,6 @@ class ElectromagneticFieldMatter(MatterModel):
             self.charge_net = SIREN(model_config, in_features=4, out_features=1)
     
     def get_potential(self, coords: torch.Tensor) -> torch.Tensor:
-        """Get electromagnetic four-potential A_μ."""
         return self.potential_net(coords)
     
     def get_field_tensor(
@@ -1410,10 +1157,6 @@ class ElectromagneticFieldMatter(MatterModel):
         coords: torch.Tensor,
         g: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Compute electromagnetic field tensor F_μν = ∂_μ A_ν - ∂_ν A_μ.
-        
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1450,11 +1193,6 @@ class ElectromagneticFieldMatter(MatterModel):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute electromagnetic stress-energy tensor.
-        
-        T_μν = 1/μ₀ [F_μα F_ν^α - ¼ g_μν F_αβ F^αβ]
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1479,7 +1217,6 @@ class ElectromagneticFieldMatter(MatterModel):
         return T
     
     def get_field_values(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Get physical field values."""
         A = self.get_potential(coords)
         F = self.get_field_tensor(coords)
         
@@ -1499,16 +1236,6 @@ class ElectromagneticFieldMatter(MatterModel):
 
 
 class DarkSectorMatter(MatterModel):
-    """
-    Dark matter and dark energy model.
-    
-    This model can represent:
-    - Cold dark matter (pressureless fluid)
-    - Warm/hot dark matter
-    - Dark energy (cosmological constant or dynamic)
-    - Interacting dark sector
-    
-    """
     
     def __init__(
         self,
@@ -1544,12 +1271,10 @@ class DarkSectorMatter(MatterModel):
             self.coupling_net = SIREN(model_config, in_features=4, out_features=1)
     
     def get_dm_density(self, coords: torch.Tensor) -> torch.Tensor:
-        """Get dark matter density."""
         raw_density = self.dm_density_net(coords)
         return F.softplus(raw_density) + 1e-6
     
     def get_de_density(self, coords: torch.Tensor) -> torch.Tensor:
-        """Get dark energy density."""
         if self.de_type == "lambda":
             batch_size = coords.shape[0]
             return self.Lambda.expand(batch_size, 1)
@@ -1563,12 +1288,6 @@ class DarkSectorMatter(MatterModel):
         g: torch.Tensor, 
         g_inv: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute dark sector stress-energy tensor.
-        
-        For dark matter: T_μν = ρ_dm u_μ u_ν (dust)
-        For dark energy: T_μν = -ρ_de g_μν (cosmological constant)
-        """
         batch_size = coords.shape[0]
         device = coords.device
         
@@ -1609,7 +1328,6 @@ class DarkSectorMatter(MatterModel):
         return T
     
     def get_field_values(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Get physical field values."""
         values = {
             "dm_density": self.get_dm_density(coords),
             "de_density": self.get_de_density(coords)
@@ -1626,20 +1344,6 @@ def create_matter_model(
     config: Optional[MatterConfig] = None,
     **kwargs
 ) -> MatterModel:
-    """
-    Factory function to create matter models.
-    
-    Args:
-        matter_type: Type of matter ("perfect_fluid", "scalar_field", etc.)
-        config: Matter configuration
-        **kwargs: Additional arguments for specific models
-        
-    Returns:
-        Matter model instance
-        
-    Raises:
-        ValueError: If matter_type is not recognized
-    """
     if config is None:
         config = MatterConfig()
     
@@ -1653,20 +1357,6 @@ def create_matter_model(
         return DarkSectorMatter(config, **kwargs)
     else:
         raise ValueError(f"Unknown matter type: {matter_type}")
-"""
-Physics-specific functions and constraints for Einstein Field Equations Solver.
-
-This module implements:
-- Physical constraint enforcement
-- Coordinate transformations and regularizations
-- Einstein Field Equations loss computation
-- Energy condition checking
-- ADM decomposition for 3+1 formalism
-- Adaptive sampling strategies
-
-All functions are designed to ensure physical validity of solutions
-to Einstein's field equations.
-"""
 
 import torch
 import torch.nn as nn
@@ -1684,23 +1374,19 @@ from dataclasses import dataclass
 
 
 class PhysicsError(Exception):
-    """Base exception for physics-related errors."""
     pass
 
 
 class CausalityViolationError(PhysicsError):
-    """Raised when causality conditions are violated."""
     pass
 
 
 class AsymptoticBehaviorError(PhysicsError):
-    """Raised when asymptotic behavior is incorrect."""
     pass
 
 
 @dataclass
 class PhysicsConfig:
-    """Configuration for physics constraints and computations."""
     einstein_weight: float = 1.0
     conservation_weight: float = 0.1
     constraint_weight: float = 0.1
@@ -1719,23 +1405,6 @@ def compute_efe_loss(
     matter_weights: Optional[List[float]] = None,
     config: Optional[PhysicsConfig] = None
 ) -> Dict[str, torch.Tensor]:
-    """
-    Compute loss based on Einstein Field Equations: G_μν + Λg_μν = 8πT_μν.
-    
-    This is the core physics loss that ensures the learned metric satisfies
-    Einstein's equations for the given matter distribution.
-    
-    Args:
-        coords: Spacetime coordinates [batch_size, 4]
-        metric_model: Neural network model for the metric
-        matter_models: List of matter models
-        matter_weights: Weights for combining matter contributions
-        config: Physics configuration
-        
-    Returns:
-        Dictionary containing various loss components
-        
-    """
     if config is None:
         config = PhysicsConfig()
     
@@ -1815,10 +1484,6 @@ def compute_conservation_loss(
     T: torch.Tensor,
     christoffel: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Compute loss for stress-energy conservation: ∇_μ T^μν = 0.
-    
-    """
     batch_size = coords.shape[0]
     device = coords.device
     
@@ -1855,15 +1520,6 @@ def compute_constraint_losses(
     g_inv: torch.Tensor,
     config: PhysicsConfig
 ) -> Dict[str, torch.Tensor]:
-    """
-    Compute various physical constraint losses.
-    
-    These constraints ensure:
-    1. Correct metric signature
-    2. Asymptotic flatness
-    3. Regularity at horizons
-    4. Causality preservation
-    """
     batch_size = coords.shape[0]
     device = coords.device
     losses = {}
@@ -1908,10 +1564,6 @@ def check_energy_condition_violations(
     g: torch.Tensor,
     g_inv: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Check violations of energy conditions and return as loss.
-    
-    """
     conditions = check_energy_conditions(T, g, g_inv)
     
     # Count violations (where condition is False)
@@ -1927,23 +1579,6 @@ def regularized_coordinates(
     singularity_centers: Optional[List[torch.Tensor]] = None,
     config: Optional[PhysicsConfig] = None
 ) -> torch.Tensor:
-    """
-    Apply coordinate regularization near singularities and horizons.
-    
-    This prevents numerical instabilities near:
-    - Black hole singularities (r = 0)
-    - Event horizons (r = 2M in Schwarzschild)
-    - Coordinate singularities
-    
-    Args:
-        coords: Input coordinates [batch_size, 4]
-        singularity_centers: List of known singularity locations
-        config: Physics configuration
-        
-    Returns:
-        Regularized coordinates
-        
-    """
     if config is None:
         config = PhysicsConfig()
     
@@ -1989,22 +1624,6 @@ def adaptive_sampling_strategy(
     config: Optional[PhysicsConfig] = None,
     max_new_points: int = 1000
 ) -> torch.Tensor:
-    """
-    Adaptively sample more points in regions of high curvature.
-    
-    This improves accuracy in regions where the metric changes rapidly,
-    such as near black holes or other strong-field sources.
-    
-    Args:
-        coords: Initial coordinates [batch_size, 4]
-        metric_model: Neural network model for the metric
-        config: Physics configuration
-        max_new_points: Maximum number of new points to add
-        
-    Returns:
-        Enhanced coordinate tensor with additional samples
-        
-    """
     if config is None:
         config = PhysicsConfig()
     
@@ -2071,21 +1690,6 @@ def schwarzschild_initial_metric(
     mass: float = 1.0,
     use_isotropic: bool = False
 ) -> torch.Tensor:
-    """
-    Compute the analytical Schwarzschild metric as initial condition.
-    
-    The Schwarzschild metric describes spacetime around a non-rotating,
-    uncharged black hole or spherical mass.
-    
-    Args:
-        coords: Spacetime coordinates [batch_size, 4]
-        mass: Mass parameter (in geometric units)
-        use_isotropic: Whether to use isotropic coordinates
-        
-    Returns:
-        Metric tensor [batch_size, 4, 4]
-        
-    """
     batch_size = coords.shape[0]
     device = coords.device
     
@@ -2137,26 +1741,6 @@ def adm_decomposition(
     metric: torch.Tensor,
     coords: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
-    """
-    Perform ADM (3+1) decomposition of the spacetime metric.
-    
-    The ADM formalism splits 4D spacetime into:
-    - 3D spatial slices (hypersurfaces)
-    - Time evolution between slices
-    
-    Components:
-    - α (lapse): Rate of time flow
-    - β^i (shift): Coordinate velocity
-    - γ_ij (3-metric): Metric on spatial slice
-    
-    Args:
-        metric: 4D metric tensor [batch_size, 4, 4]
-        coords: Spacetime coordinates [batch_size, 4]
-        
-    Returns:
-        Dictionary with ADM variables
-        
-    """
     batch_size = metric.shape[0]
     device = metric.device
     
@@ -2193,18 +1777,6 @@ def hamiltonian_constraint(
     extrinsic_curvature: torch.Tensor,
     matter_density: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """
-    Compute the Hamiltonian constraint in the ADM formalism.
-    
-    The Hamiltonian constraint is:
-    H = R - K² + K_ij K^ij - 16π ρ = 0
-    
-    where:
-    - R is the 3D Ricci scalar
-    - K is the trace of extrinsic curvature
-    - ρ is the energy density
-    
-    """
     batch_size = spatial_metric.shape[0]
     device = spatial_metric.device
     
@@ -2241,17 +1813,6 @@ def momentum_constraint(
     extrinsic_curvature: torch.Tensor,
     matter_momentum: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """
-    Compute the momentum constraint in the ADM formalism.
-    
-    The momentum constraint is:
-    M^i = D_j K^ij - D^i K - 8π J^i = 0
-    
-    where:
-    - D_j is the covariant derivative on the 3-space
-    - J^i is the momentum density
-    
-    """
     batch_size = spatial_metric.shape[0]
     device = spatial_metric.device
     
@@ -2263,12 +1824,6 @@ def momentum_constraint(
         M -= 8 * np.pi * matter_momentum
     
     return M
-"""
-Gravitational system class for combining metric and matter models.
-
-This module provides the main interface for setting up and training
-Einstein Field Equations solvers.
-"""
 
 import torch
 import torch.nn as nn
@@ -2285,13 +1840,11 @@ from dataclasses import dataclass
 
 
 class SystemError(Exception):
-    """Base exception for system-related errors."""
     pass
 
 
 @dataclass
 class SystemConfig:
-    """Configuration for gravitational system."""
     device: Optional[torch.device] = None
     dtype: torch.dtype = torch.float32
     physics_config: Optional[PhysicsConfig] = None
@@ -2299,37 +1852,6 @@ class SystemConfig:
 
 
 class GravitationalSystem:
-    """
-    Main class for solving Einstein Field Equations.
-    
-    This class combines:
-    - A neural network model for the spacetime metric
-    - One or more matter models contributing to stress-energy
-    - Training procedures that enforce Einstein's equations
-    - Analysis and visualization tools
-    
-    Example:
-    --------
-    ```python
-    # Create metric model
-    metric_model = create_metric_model("siren")
-    
-    # Create matter models
-    matter1 = create_matter_model("perfect_fluid", eos_type="dust")
-    matter2 = create_matter_model("scalar_field", potential_type="quadratic")
-    
-    # Create system
-    system = GravitationalSystem(
-        metric_model=metric_model,
-        matter_models=[matter1, matter2],
-        matter_weights=[0.7, 0.3]  # 70% dust, 30% scalar field
-    )
-    
-    # Train
-    history = system.train(epochs=1000, batch_size=512)
-    ```
-    
-    """
     
     def __init__(
         self,
@@ -2383,17 +1905,6 @@ class GravitationalSystem:
         g: Optional[torch.Tensor] = None,
         g_inv: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Compute the total stress-energy tensor from all matter sources.
-        
-        Args:
-            coords: Spacetime coordinates
-            g: Metric tensor (computed if not provided)
-            g_inv: Inverse metric (computed if not provided)
-            
-        Returns:
-            Total stress-energy tensor
-        """
         if g is None:
             g = self.metric_model(coords).reshape(-1, 4, 4)
             g = 0.5 * (g + g.transpose(-2, -1))  # Ensure symmetry
@@ -2420,19 +1931,6 @@ class GravitationalSystem:
         avoid_horizon: bool = True,
         adaptive: bool = True
     ) -> torch.Tensor:
-        """
-        Sample spacetime coordinates for training.
-        
-        Args:
-            batch_size: Number of points to sample
-            T_range: Time coordinate range
-            spatial_range: Spatial coordinate range [-L, L]³
-            avoid_horizon: Whether to avoid sampling near horizons
-            adaptive: Whether to use adaptive sampling
-            
-        Returns:
-            Sampled coordinates [batch_size, 4]
-        """
         # Initial uniform sampling
         coords = torch.zeros(batch_size, 4, device=self.device)
         
@@ -2461,15 +1959,6 @@ class GravitationalSystem:
         return coords
     
     def compute_loss(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Compute all loss components for the given coordinates.
-        
-        Args:
-            coords: Spacetime coordinates
-            
-        Returns:
-            Dictionary of loss components
-        """
         return compute_efe_loss(
             coords,
             self.metric_model,
@@ -2486,19 +1975,6 @@ class GravitationalSystem:
         T_range: Tuple[float, float],
         spatial_range: float
     ) -> Dict[str, float]:
-        """
-        Perform one training step.
-        
-        Args:
-            optimizer_metric: Optimizer for metric model
-            optimizer_matter: Optimizer for matter models (optional)
-            batch_size: Batch size
-            T_range: Time range for sampling
-            spatial_range: Spatial range for sampling
-            
-        Returns:
-            Dictionary of loss values
-        """
         # Sample coordinates
         coords = self.sample_coordinates(
             batch_size,
@@ -2545,36 +2021,6 @@ class GravitationalSystem:
         checkpoint_interval: int = 100,
         checkpoint_path: Optional[str] = None
     ) -> Dict[str, List[float]]:
-        """
-        Train the gravitational system.
-        
-        Args:
-            epochs: Number of training epochs
-            batch_size: Batch size for training
-            T_range: Time coordinate range
-            spatial_range: Spatial coordinate range
-            lr_metric: Learning rate for metric model
-            lr_matter: Learning rate for matter models
-            train_matter: Whether to train matter models
-            scheduler_params: Parameters for learning rate scheduler
-            checkpoint_interval: Save checkpoint every N epochs
-            checkpoint_path: Path to save checkpoints
-            
-        Returns:
-            Training history dictionary
-            
-        Example:
-        --------
-        ```python
-        history = system.train(
-            epochs=1000,
-            batch_size=512,
-            spatial_range=20.0,
-            lr_metric=1e-4,
-            scheduler_params={'factor': 0.5, 'patience': 100}
-        )
-        ```
-        """
         # Create optimizers
         optimizer_metric = torch.optim.Adam(
             self.metric_model.parameters(),
@@ -2665,7 +2111,6 @@ class GravitationalSystem:
         optimizer_metric: torch.optim.Optimizer,
         optimizer_matter: Optional[torch.optim.Optimizer] = None
     ):
-        """Save training checkpoint."""
         checkpoint = {
             'epoch': epoch,
             'metric_model_state': self.metric_model.state_dict(),
@@ -2688,7 +2133,6 @@ class GravitationalSystem:
             print(f"Saved checkpoint to {path}")
     
     def load_checkpoint(self, path: str):
-        """Load training checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         
         # Load metric model
@@ -2714,16 +2158,6 @@ class GravitationalSystem:
         test_coords: torch.Tensor,
         return_components: bool = False
     ) -> Dict[str, torch.Tensor]:
-        """
-        Evaluate the system at given coordinates.
-        
-        Args:
-            test_coords: Test coordinates
-            return_components: Whether to return individual components
-            
-        Returns:
-            Dictionary of evaluation results
-        """
         with torch.no_grad():
             # Get metric
             g = self.metric_model(test_coords).reshape(-1, 4, 4)
@@ -2762,22 +2196,12 @@ class GravitationalSystem:
             return results
     
     def predict_metric(self, coords: torch.Tensor) -> torch.Tensor:
-        """
-        Predict the metric at given coordinates.
-        
-        Args:
-            coords: Spacetime coordinates
-            
-        Returns:
-            Metric tensor
-        """
         with torch.no_grad():
             g = self.metric_model(coords).reshape(-1, 4, 4)
             g = 0.5 * (g + g.transpose(-2, -1))
             return g
     
     def predict_curvature(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Predict curvature quantities."""
         from __main__ import (
             compute_einstein_tensor_vectorized,
             compute_kretschmann_scalar,
@@ -2802,7 +2226,6 @@ class GravitationalSystem:
 
 # Plot training loss curves
 def plot_training_history(history: Dict[str, List[float]], filename: str = "training_history.png"):
-    """Plot and save training loss curves."""
     epochs = range(1, len(history.get("total_loss", [])) + 1)
     plt.style.use("seaborn-v0_8")
     fig, ax = plt.subplots()
@@ -2822,7 +2245,6 @@ def plot_training_history(history: Dict[str, List[float]], filename: str = "trai
 # Example usage
 
 def run_example():
-    """Run a simple example of the EFES system."""
     print("Running EFES Example...")
 
     metric_model = create_metric_model("siren")
