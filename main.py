@@ -1,48 +1,16 @@
-"""
-EFES Main Module (Single File)
-
-This file merges the entire EFES package into a standalone script.
-"""
+"""Unified EFES module."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import time
 
-"""
-Vectorized tensor calculus operations for Einstein Field Equations.
-
-This module implements highly optimized, fully vectorized operations for computing
-geometric quantities in General Relativity, including:
-- Christoffel symbols
-- Riemann curvature tensor
-- Ricci tensor and scalar
-- Einstein tensor
-
-All operations are implemented using PyTorch's vectorized operations, avoiding
-explicit loops for improved performance on GPUs.
-
-Physics Approximations:
-----------------------
-1. Numerical Derivatives: We use finite differences with adaptive step sizes
-   for computing metric derivatives. This approximation is valid when the
-   metric varies smoothly on scales larger than the step size.
-   
-2. Static Metric Approximation: For time derivatives (∂_t), we currently assume
-   a static or slowly varying metric. This is valid for:
-   - Schwarzschild spacetime
-   - Slowly rotating Kerr spacetime
-   - Cosmological solutions with slow time evolution
-   
-3. Coordinate Singularity Handling: Near coordinate singularities (e.g., r=2M
-   in Schwarzschild coordinates), we apply regularization to avoid numerical
-   instabilities. This does not affect the physical predictions away from
-   these regions.
-"""
+"""Vectorized tensor calculus for Einstein's equations."""
 
 import torch
 import torch.nn.functional as F
@@ -76,19 +44,7 @@ class TensorConfig:
 
 
 def safe_inverse(matrix: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    """
-    Compute matrix inverse with regularization for near-singular matrices.
-    
-    Args:
-        matrix: Input matrix tensor of shape [..., n, n]
-        epsilon: Regularization parameter
-        
-    Returns:
-        Inverse matrix
-        
-    Raises:
-        MetricSingularityError: If matrix is too singular even after regularization
-    """
+    """Compute regularized matrix inverse."""
     try:
         # Add small identity matrix for regularization
         batch_shape = matrix.shape[:-2]
@@ -119,25 +75,7 @@ def compute_metric_derivatives_vectorized(
     metric_func: Optional[torch.nn.Module] = None,
     config: Optional[TensorConfig] = None
 ) -> torch.Tensor:
-    """
-    Compute derivatives of the metric tensor using automatic differentiation
-    or finite differences, fully vectorized.
-    
-    Args:
-        g: Metric tensor of shape [batch_size, 4, 4]
-        coords: Coordinates of shape [batch_size, 4] 
-        metric_func: Optional metric function for autodiff
-        config: Configuration parameters
-        
-    Returns:
-        Metric derivatives of shape [batch_size, 4, 4, 4]
-        where the last index is the derivative index
-        
-    Physics Note:
-    -------------
-    The derivative ∂_μ g_αβ represents how the metric components change
-    with respect to coordinate μ. For static metrics, ∂_t g_αβ = 0.
-    """
+    """Vectorized metric derivatives."""
     if config is None:
         config = TensorConfig()
         
@@ -230,29 +168,7 @@ def compute_christoffel_symbols_vectorized(
     metric_func: Optional[torch.nn.Module] = None,
     config: Optional[TensorConfig] = None
 ) -> torch.Tensor:
-    """
-    Compute Christoffel symbols using fully vectorized operations.
-    
-    Christoffel symbols of the second kind:
-    Γ^λ_μν = (1/2) g^λσ (∂_μ g_νσ + ∂_ν g_μσ - ∂_σ g_μν)
-    
-    Args:
-        g: Metric tensor [batch_size, 4, 4]
-        g_inv: Inverse metric (computed if not provided)
-        dg: Metric derivatives [batch_size, 4, 4, 4] (computed if not provided)
-        coords: Coordinates (needed if dg not provided)
-        metric_func: Metric function (needed if dg not provided)
-        config: Configuration parameters
-        
-    Returns:
-        Christoffel symbols [batch_size, 4, 4, 4]
-        
-    Physics Note:
-    -------------
-    Christoffel symbols represent the connection coefficients that describe
-    how vectors change when parallel transported. They are not tensors but
-    transform in a specific way under coordinate transformations.
-    """
+    """Vectorized Christoffel symbols."""
     if config is None:
         config = TensorConfig()
     
@@ -305,27 +221,7 @@ def compute_riemann_tensor_vectorized(
     coords: Optional[torch.Tensor] = None,
     config: Optional[TensorConfig] = None
 ) -> torch.Tensor:
-    """
-    Compute the Riemann curvature tensor using fully vectorized operations.
-    
-    Riemann tensor:
-    R^ρ_σμν = ∂_μ Γ^ρ_νσ - ∂_ν Γ^ρ_μσ + Γ^ρ_μλ Γ^λ_νσ - Γ^ρ_νλ Γ^λ_μσ
-    
-    Args:
-        christoffel: Christoffel symbols [batch_size, 4, 4, 4]
-        dchristoffel: Derivatives of Christoffel symbols (computed if not provided)
-        coords: Coordinates (needed if dchristoffel not provided)
-        config: Configuration parameters
-        
-    Returns:
-        Riemann tensor [batch_size, 4, 4, 4, 4]
-        
-    Physics Note:
-    -------------
-    The Riemann tensor is the fundamental measure of spacetime curvature.
-    It vanishes if and only if spacetime is flat. For numerical stability,
-    we focus on the product terms when derivatives are not available.
-    """
+    """Vectorized Riemann tensor."""
     if config is None:
         config = TensorConfig()
     
@@ -360,23 +256,7 @@ def compute_riemann_tensor_vectorized(
 
 
 def compute_ricci_tensor_vectorized(riemann: torch.Tensor) -> torch.Tensor:
-    """
-    Compute Ricci tensor by contracting the Riemann tensor.
-    
-    Ricci tensor: R_μν = R^λ_μλν
-    
-    Args:
-        riemann: Riemann tensor [batch_size, 4, 4, 4, 4]
-        
-    Returns:
-        Ricci tensor [batch_size, 4, 4]
-        
-    Physics Note:
-    -------------
-    The Ricci tensor represents the trace of the Riemann tensor and appears
-    directly in Einstein's field equations. It measures the local volume
-    distortion caused by gravity.
-    """
+    """Contract Riemann tensor to Ricci tensor."""
     # Contract first and third indices: R_μν = R^λ_μλν
     # riemann shape: [batch, ρ, σ, μ, ν]
     # We want: R^λ_μλν, so contract indices 0 and 2
@@ -394,24 +274,7 @@ def compute_ricci_scalar_vectorized(
     ricci: torch.Tensor,
     g_inv: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Compute Ricci scalar (scalar curvature).
-    
-    Ricci scalar: R = g^μν R_μν
-    
-    Args:
-        ricci: Ricci tensor [batch_size, 4, 4]
-        g_inv: Inverse metric [batch_size, 4, 4]
-        
-    Returns:
-        Ricci scalar [batch_size]
-        
-    Physics Note:
-    -------------
-    The Ricci scalar is a scalar invariant that gives the trace of the
-    Ricci tensor. It appears in the Einstein-Hilbert action and represents
-    the simplest scalar measure of curvature.
-    """
+    """Compute Ricci scalar."""
     # Contract Ricci tensor with inverse metric
     ricci_scalar = torch.einsum('...ij,...ij->...', g_inv, ricci)
     
@@ -425,28 +288,7 @@ def compute_einstein_tensor_vectorized(
     config: Optional[TensorConfig] = None,
     return_components: bool = False
 ) -> torch.Tensor:
-    """
-    Compute the Einstein tensor G_μν = R_μν - (1/2)Rg_μν using fully
-    vectorized operations.
-    
-    Args:
-        g: Metric tensor [batch_size, 4, 4]
-        coords: Coordinates [batch_size, 4]
-        metric_func: Optional metric function for derivatives
-        config: Configuration parameters
-        return_components: If True, return intermediate components
-        
-    Returns:
-        Einstein tensor [batch_size, 4, 4]
-        If return_components=True, returns dict with all components
-        
-    Physics Note:
-    -------------
-    The Einstein tensor encodes the geometry of spacetime and appears on
-    the left side of Einstein's field equations. It satisfies the important
-    property ∇_μ G^μν = 0 (contracted Bianchi identity), which ensures
-    conservation of energy-momentum.
-    """
+    """Vectorized Einstein tensor."""
     if config is None:
         config = TensorConfig()
     
@@ -501,16 +343,7 @@ def _approximate_einstein_tensor(
     coords: torch.Tensor,
     config: TensorConfig
 ) -> torch.Tensor:
-    """
-    Compute an approximate Einstein tensor for cases where the full
-    calculation fails due to numerical issues.
-    
-    Physics Note:
-    -------------
-    This approximation assumes a spherically symmetric spacetime with
-    1/r³ falloff in curvature, typical of vacuum solutions near a
-    central mass. This is used only as a fallback for numerical stability.
-    """
+    """Approximate Einstein tensor."""
     batch_size = coords.shape[0]
     device = coords.device
     
@@ -541,11 +374,6 @@ def compute_kretschmann_scalar(riemann: torch.Tensor) -> torch.Tensor:
     Returns:
         Kretschmann scalar [batch_size]
         
-    Physics Note:
-    -------------
-    The Kretschmann scalar is a quadratic curvature invariant that measures
-    the "strength" of the gravitational field. Unlike the Ricci scalar, it
-    is non-zero even in vacuum (e.g., outside a black hole).
     """
     # Contract all indices: K = R^μνρσ R_μνρσ
     kretschmann = torch.einsum('...ijkl,...ijkl->...', riemann, riemann)
@@ -558,27 +386,7 @@ def check_energy_conditions(
     g: torch.Tensor,
     g_inv: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
-    """
-    Check various energy conditions for the stress-energy tensor.
-    
-    Args:
-        T: Stress-energy tensor [batch_size, 4, 4]
-        g: Metric tensor [batch_size, 4, 4]
-        g_inv: Inverse metric [batch_size, 4, 4]
-        
-    Returns:
-        Dictionary with boolean tensors for each energy condition
-        
-    Physics Note:
-    -------------
-    Energy conditions are constraints on the stress-energy tensor that
-    ensure physically reasonable matter distributions:
-    
-    1. Weak Energy Condition (WEC): T_μν u^μ u^ν ≥ 0 for all timelike u^μ
-    2. Null Energy Condition (NEC): T_μν k^μ k^ν ≥ 0 for all null k^μ
-    3. Strong Energy Condition (SEC): (T_μν - 1/2 T g_μν) u^μ u^ν ≥ 0
-    4. Dominant Energy Condition (DEC): T_μν u^μ is non-spacelike
-    """
+    """Check stress-energy energy conditions."""
     batch_size = T.shape[0]
     device = T.device
     
@@ -668,11 +476,6 @@ class Sine(nn.Module):
     """
     Sine activation function for SIREN networks.
     
-    Physics Note:
-    -------------
-    Sinusoidal activations are particularly well-suited for representing
-    smooth functions and their derivatives, making them ideal for learning
-    metric functions in GR where smoothness is essential.
     """
     
     def __init__(self, omega: float = 30.0, learnable: bool = False):
@@ -690,11 +493,6 @@ class FourierFeatures(nn.Module):
     """
     Random Fourier features for improved representation of high-frequency functions.
     
-    Physics Note:
-    -------------
-    Fourier features help neural networks learn functions with rapid spatial
-    variations, which is important near strong gravitational sources where
-    the metric can change rapidly.
     """
     
     def __init__(self, in_features: int, num_frequencies: int = 128, 
@@ -976,11 +774,6 @@ class PhysicsInformedNet(nn.Module):
     2. Conservation laws
     3. Asymptotic behavior
     
-    Physics Note:
-    -------------
-    By building physical constraints into the network architecture, we
-    ensure that the learned solutions respect fundamental principles of
-    General Relativity, improving both accuracy and training efficiency.
     """
     
     def __init__(self, config: Optional[ModelConfig] = None,
@@ -1102,13 +895,6 @@ to the stress-energy tensor in Einstein's field equations, including:
 Each matter model computes its contribution to the stress-energy tensor
 T_μν, which appears on the right-hand side of Einstein's equations.
 
-Physics Note:
--------------
-The stress-energy tensor T_μν encodes the density and flux of energy
-and momentum in spacetime. It must satisfy:
-1. Symmetry: T_μν = T_νμ
-2. Conservation: ∇_μ T^μν = 0
-3. Energy conditions (for physical matter)
 """
 
 import torch
@@ -1226,11 +1012,6 @@ class MatterModel(nn.Module, ABC):
         Returns:
             Conservation violation [batch_size, 4]
             
-        Physics Note:
-        -------------
-        Conservation of stress-energy is automatic in GR when the matter
-        equations of motion are satisfied. Violations indicate either
-        numerical errors or unphysical matter configurations.
         """
         batch_size = coords.shape[0]
         device = coords.device
@@ -1324,13 +1105,6 @@ class PerfectFluidMatter(MatterModel):
         """
         Compute pressure from density using equation of state.
         
-        Physics Note:
-        -------------
-        Different values of w in p = wρ correspond to:
-        - w = 0: Dust (non-relativistic matter)
-        - w = 1/3: Radiation
-        - w = -1: Cosmological constant
-        - -1 < w < -1/3: Quintessence
         """
         if self.eos_type == "linear":
             return self.w * density
@@ -1482,12 +1256,6 @@ class ScalarFieldMatter(MatterModel):
         """
         Compute the scalar field potential V(φ).
         
-        Physics Note:
-        -------------
-        The choice of potential determines the dynamics:
-        - Quadratic: Simple massive scalar field
-        - Quartic: Self-interacting field (φ⁴ theory)
-        - Exponential: Quintessence dark energy models
         """
         if self.complex_field:
             # For complex field, use |φ|² = φ*φ
@@ -1645,10 +1413,6 @@ class ElectromagneticFieldMatter(MatterModel):
         """
         Compute electromagnetic field tensor F_μν = ∂_μ A_ν - ∂_ν A_μ.
         
-        Physics Note:
-        -------------
-        The field tensor is antisymmetric and gauge-invariant. Its components
-        encode the electric and magnetic fields in the given reference frame.
         """
         batch_size = coords.shape[0]
         device = coords.device
@@ -1744,11 +1508,6 @@ class DarkSectorMatter(MatterModel):
     - Dark energy (cosmological constant or dynamic)
     - Interacting dark sector
     
-    Physics Note:
-    -------------
-    Dark matter and dark energy constitute ~95% of the universe's energy
-    content. While their fundamental nature is unknown, their gravitational
-    effects are well-described by their stress-energy contributions.
     """
     
     def __init__(
@@ -1976,17 +1735,6 @@ def compute_efe_loss(
     Returns:
         Dictionary containing various loss components
         
-    Physics Note:
-    -------------
-    Einstein's field equations relate the geometry of spacetime (left side)
-    to its energy-momentum content (right side). In geometric units (G=c=1):
-    
-    G_μν + Λg_μν = 8π T_μν
-    
-    where:
-    - G_μν is the Einstein tensor (geometry)
-    - Λ is the cosmological constant
-    - T_μν is the stress-energy tensor (matter/energy)
     """
     if config is None:
         config = PhysicsConfig()
@@ -2070,12 +1818,6 @@ def compute_conservation_loss(
     """
     Compute loss for stress-energy conservation: ∇_μ T^μν = 0.
     
-    Physics Note:
-    -------------
-    Conservation of stress-energy is a fundamental requirement that follows
-    from the Bianchi identity and Einstein's equations. It ensures that
-    energy and momentum are neither created nor destroyed, only transformed
-    or transported through spacetime.
     """
     batch_size = coords.shape[0]
     device = coords.device
@@ -2169,13 +1911,6 @@ def check_energy_condition_violations(
     """
     Check violations of energy conditions and return as loss.
     
-    Physics Note:
-    -------------
-    Energy conditions restrict the types of matter/energy that can exist:
-    - Weak: No observer measures negative energy density
-    - Null: Energy density along light rays is non-negative
-    - Strong: Gravity is always attractive
-    - Dominant: Energy flow is causal (subluminal)
     """
     conditions = check_energy_conditions(T, g, g_inv)
     
@@ -2208,12 +1943,6 @@ def regularized_coordinates(
     Returns:
         Regularized coordinates
         
-    Physics Note:
-    -------------
-    Many coordinate systems have singularities that are artifacts of the
-    coordinate choice, not physical singularities. This function helps
-    avoid numerical issues near such coordinate singularities while
-    preserving the physics away from them.
     """
     if config is None:
         config = PhysicsConfig()
@@ -2275,11 +2004,6 @@ def adaptive_sampling_strategy(
     Returns:
         Enhanced coordinate tensor with additional samples
         
-    Physics Note:
-    -------------
-    Curvature measures how much spacetime deviates from flatness. High
-    curvature regions require denser sampling for accurate representation
-    of the metric and its derivatives.
     """
     if config is None:
         config = PhysicsConfig()
@@ -2361,13 +2085,6 @@ def schwarzschild_initial_metric(
     Returns:
         Metric tensor [batch_size, 4, 4]
         
-    Physics Note:
-    -------------
-    The Schwarzschild solution is the unique spherically symmetric vacuum
-    solution to Einstein's equations. It's characterized by:
-    - Event horizon at r = 2M
-    - Singularity at r = 0
-    - Asymptotically flat (Minkowski) as r → ∞
     """
     batch_size = coords.shape[0]
     device = coords.device
@@ -2439,13 +2156,6 @@ def adm_decomposition(
     Returns:
         Dictionary with ADM variables
         
-    Physics Note:
-    -------------
-    The ADM formalism is essential for:
-    - Numerical relativity simulations
-    - Initial value problems in GR
-    - Studying dynamics of spacetime
-    - Black hole and gravitational wave physics
     """
     batch_size = metric.shape[0]
     device = metric.device
@@ -2494,11 +2204,6 @@ def hamiltonian_constraint(
     - K is the trace of extrinsic curvature
     - ρ is the energy density
     
-    Physics Note:
-    -------------
-    The Hamiltonian constraint is the projection of Einstein's equations
-    normal to the spatial hypersurface. It constrains the initial data
-    in numerical relativity simulations.
     """
     batch_size = spatial_metric.shape[0]
     device = spatial_metric.device
@@ -2546,11 +2251,6 @@ def momentum_constraint(
     - D_j is the covariant derivative on the 3-space
     - J^i is the momentum density
     
-    Physics Note:
-    -------------
-    The momentum constraint is the projection of Einstein's equations
-    tangent to the spatial hypersurface. It ensures conservation of
-    momentum in the evolution.
     """
     batch_size = spatial_metric.shape[0]
     device = spatial_metric.device
@@ -2629,12 +2329,6 @@ class GravitationalSystem:
     history = system.train(epochs=1000, batch_size=512)
     ```
     
-    Physics Note:
-    -------------
-    The system solves the coupled Einstein-matter equations:
-    - Geometry side: G_μν + Λg_μν (from the metric model)
-    - Matter side: 8πT_μν (from matter models)
-    The training process finds a metric that satisfies G_μν + Λg_μν = 8πT_μν
     """
     
     def __init__(
@@ -3083,7 +2777,7 @@ class GravitationalSystem:
             return g
     
     def predict_curvature(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Predict curvature quantities at given coordinates."""
+        """Predict curvature quantities."""
         from __main__ import (
             compute_einstein_tensor_vectorized,
             compute_kretschmann_scalar,
@@ -3096,14 +2790,33 @@ class GravitationalSystem:
                 g, coords, self.metric_model, tensor_config, return_components=True
             )
             kretschmann = compute_kretschmann_scalar(components["riemann"])
-            return {
-                "einstein_tensor": components["einstein"],
-                "ricci_tensor": components["ricci"],
-                "ricci_scalar": components["ricci_scalar"],
-                "riemann_tensor": components["riemann"],
-                "kretschmann_scalar": kretschmann
-            }
+        return {
+            "einstein_tensor": components["einstein"],
+            "ricci_tensor": components["ricci"],
+            "ricci_scalar": components["ricci_scalar"],
+            "riemann_tensor": components["riemann"],
+            "kretschmann_scalar": kretschmann
+        }
 
+
+
+# Plot training loss curves
+def plot_training_history(history: Dict[str, List[float]], filename: str = "training_history.png"):
+    """Plot and save training loss curves."""
+    epochs = range(1, len(history.get("total_loss", [])) + 1)
+    plt.style.use("seaborn-v0_8")
+    fig, ax = plt.subplots()
+    if "total_loss" in history:
+        ax.plot(epochs, history["total_loss"], label="total", marker="o")
+    if "efe_loss" in history:
+        ax.plot(epochs, history["efe_loss"], label="efe", marker="s")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.legend()
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(filename)
+    plt.close(fig)
 
 
 # Example usage
@@ -3117,6 +2830,7 @@ def run_example():
     system = GravitationalSystem(metric_model, [matter])
 
     history = system.train(epochs=20, batch_size=64)
+    plot_training_history(history)
 
     coords = torch.tensor([[0.0, 5.0, 0.0, 0.0],
                            [0.0, 10.0, 0.0, 0.0]])
