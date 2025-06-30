@@ -897,11 +897,11 @@ class PerfectFluidMatter(MatterModel):
         # Equation of state parameters
         if eos_type == "linear":
             # p = w * ρ
-            self.w = nn.Parameter(torch.tensor(eos_params.get("w", 0.0)))
+            self.w = nn.Parameter(torch.tensor(self.eos_params.get("w", 0.0)))
         elif eos_type == "polytropic":
             # p = K * ρ^Γ
-            self.K = nn.Parameter(torch.tensor(eos_params.get("K", 1.0)))
-            self.Gamma = nn.Parameter(torch.tensor(eos_params.get("Gamma", 5/3)))
+            self.K = nn.Parameter(torch.tensor(self.eos_params.get("K", 1.0)))
+            self.Gamma = nn.Parameter(torch.tensor(self.eos_params.get("Gamma", 5/3)))
     
     def equation_of_state(self, density: torch.Tensor) -> torch.Tensor:
         if self.eos_type == "linear":
