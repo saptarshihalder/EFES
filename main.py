@@ -614,13 +614,6 @@ class MetricNet(nn.Module):
             # This helps maintain correct signature
             metric = identity + 0.1 * metric
             
-            # Additional scaling to ensure time component stays negative
-            metric[:, 0, 0] = -torch.abs(metric[:, 0, 0]) * self.time_scale
-            
-            # Ensure spatial components stay positive on diagonal
-            for i in range(1, 4):
-                metric[:, i, i] = torch.abs(metric[:, i, i]) * self.space_scale
-        
             # Re-compute diagonal using torch.diagonal for consistent gradients
             diag = torch.diagonal(metric, dim1=-2, dim2=-1)
             diag_time = -torch.abs(diag[:, 0]) * self.time_scale
@@ -975,10 +968,10 @@ class PerfectFluidMatter(MatterModel):
         
         # (ρ + p) u_μ u_ν term
         rho_plus_p = density + pressure
-        T += torch.einsum('...,...i,...j->...ij', rho_plus_p, u_lower, u_lower)
+        T += torch.einsum('...,...i,...j->...ij', rho_plus_p.squeeze(-1), u_lower, u_lower)
         
         # p g_μν term
-        T += torch.einsum('...,...ij->...ij', pressure, g)
+        T += torch.einsum('...,...ij->...ij', pressure.squeeze(-1), g)
         
         # Ensure symmetry
         T = 0.5 * (T + T.transpose(-2, -1))
@@ -1562,8 +1555,8 @@ def compute_constraint_losses(
         eigenvalues = torch.linalg.eigvals(g).real
         
         # Should have exactly one negative eigenvalue (timelike direction)
-        neg_count = torch.sum(eigenvalues < 0, dim=1)
-        causality_loss = torch.mean((neg_count - 1)**2).float()
+        neg_count = torch.sum(eigenvalues < 0, dim=1).float()
+        causality_loss = torch.mean((neg_count - 1.0)**2)
         losses['causality'] = causality_loss
     
     return losses
@@ -2172,38 +2165,38 @@ class GravitationalSystem:
             # Get metric
             g = self.metric_model(test_coords).reshape(-1, 4, 4)
             g = 0.5 * (g + g.transpose(-2, -1))
-            
+
             # Get inverse metric
             g_inv = safe_inverse(g)
-            
+
             # Get stress-energy
             T = self.combined_stress_energy(test_coords, g, g_inv)
-            
-            # Compute losses
-            losses = self.compute_loss(test_coords)
-            
-            results = {
-                'metric': g,
-                'stress_energy': T,
-                'losses': losses
-            }
-            
-            if return_components:
-                # Get individual matter contributions
-                matter_components = []
-                for model, weight in zip(self.matter_models, self.matter_weights):
-                    T_contrib = model.get_stress_energy(test_coords, g, g_inv)
-                    matter_components.append(weight * T_contrib)
-                results['matter_components'] = matter_components
-                
-                # Get matter field values
-                field_values = []
-                for model in self.matter_models:
-                    fields = model.get_field_values(test_coords)
-                    field_values.append(fields)
-                results['field_values'] = field_values
-            
-            return results
+
+        # Compute losses (requires gradients)
+        losses = self.compute_loss(test_coords)
+
+        results = {
+            'metric': g,
+            'stress_energy': T,
+            'losses': losses
+        }
+
+        if return_components:
+            # Get individual matter contributions
+            matter_components = []
+            for model, weight in zip(self.matter_models, self.matter_weights):
+                T_contrib = model.get_stress_energy(test_coords, g, g_inv)
+                matter_components.append(weight * T_contrib)
+            results['matter_components'] = matter_components
+
+            # Get matter field values
+            field_values = []
+            for model in self.matter_models:
+                fields = model.get_field_values(test_coords)
+                field_values.append(fields)
+            results['field_values'] = field_values
+
+        return results
     
     def predict_metric(self, coords: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
