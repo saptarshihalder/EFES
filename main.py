@@ -195,7 +195,7 @@ def compute_christoffel_symbols_vectorized(
     christoffel = 0.5 * torch.einsum('...ls,...smn->...lmn', g_inv, combined)
     
     # Apply regularization to prevent numerical instabilities
-    christoffel_norm = christoffel.norm(dim=(1, 2, 3), keepdim=True)
+    christoffel_norm = torch.linalg.vector_norm(christoffel, ord=2, dim=(1, 2, 3), keepdim=True)
     if (christoffel_norm > config.max_christoffel_norm).any():
         # Clip large values
         scale = config.max_christoffel_norm / (christoffel_norm + config.epsilon)
@@ -929,17 +929,17 @@ class PerfectFluidMatter(MatterModel):
         u_raw = self.velocity_net(coords)
         
         # Normalize to satisfy g_μν u^μ u^ν = -1
-        # Start with mostly timelike vector
-        u = torch.zeros_like(u_raw)
-        u[:, 0] = 1.0  # Timelike component
-        u[:, 1:] = 0.1 * torch.tanh(u_raw[:, 1:])  # Small spatial components
-        
+        # Start with mostly timelike vector (avoid in-place operations to keep autograd happy)
+        spatial_part = 0.1 * torch.tanh(u_raw[:, 1:])
+        u_temp = torch.cat([torch.ones(batch_size, 1, device=device), spatial_part], dim=1)
+
         # Compute norm
-        u_norm_sq = torch.einsum('...i,...ij,...j->...', u, g, u)
-        
-        # Normalize
-        u[:, 0] = u[:, 0] * torch.sqrt(-1.0 / u_norm_sq)
-        
+        u_norm_sq = torch.einsum('...i,...ij,...j->...', u_temp, g, u_temp)
+
+        # Normalize time component
+        time_component = torch.sqrt(-1.0 / u_norm_sq)
+        u = torch.cat([time_component.unsqueeze(-1), spatial_part], dim=1)
+
         return u
     
     def get_stress_energy(
@@ -1297,13 +1297,14 @@ class DarkSectorMatter(MatterModel):
         rho_dm = self.get_dm_density(coords)
         
         # For cold dark matter, assume comoving (u^μ = (1,0,0,0) in comoving frame)
-        u = torch.zeros(batch_size, 4, device=device)
-        u[:, 0] = 1.0
-        
-        # Normalize four-velocity
-        u_norm_sq = torch.einsum('...i,...ij,...j->...', u, g, u)
-        u[:, 0] = u[:, 0] * torch.sqrt(-1.0 / u_norm_sq)
-        
+        u_temp = torch.zeros(batch_size, 4, device=device)
+        u_temp[:, 0] = 1.0
+
+        # Normalize four-velocity without in-place operations
+        u_norm_sq = torch.einsum('...i,...ij,...j->...', u_temp, g, u_temp)
+        time_component = torch.sqrt(-1.0 / u_norm_sq)
+        u = torch.cat([time_component.unsqueeze(-1), torch.zeros(batch_size, 3, device=device)], dim=1)
+
         # Lower indices
         u_lower = torch.einsum('...ij,...j->...i', g, u)
         
