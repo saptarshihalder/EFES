@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -597,6 +596,9 @@ class MetricNet(nn.Module):
         batch_size = coords.shape[0]
         metric = metric_raw.reshape(batch_size, 4, 4)
         
+        # Use clone to avoid potential autograd issues with in-place ops on views
+        metric = metric_raw.reshape(batch_size, 4, 4).clone()
+        
         # Enforce symmetry
         if self.enforce_symmetry:
             metric = 0.5 * (metric + metric.transpose(-2, -1))
@@ -618,6 +620,13 @@ class MetricNet(nn.Module):
             # Ensure spatial components stay positive on diagonal
             for i in range(1, 4):
                 metric[:, i, i] = torch.abs(metric[:, i, i]) * self.space_scale
+        
+            # Re-compute diagonal using torch.diagonal for consistent gradients
+            diag = torch.diagonal(metric, dim1=-2, dim2=-1)
+            diag_time = -torch.abs(diag[:, 0]) * self.time_scale
+            diag_space = torch.abs(diag[:, 1:]) * self.space_scale
+            new_diag = torch.cat([diag_time.unsqueeze(-1), diag_space], dim=1)
+            metric = metric - torch.diag_embed(diag) + torch.diag_embed(new_diag)
         
         # Flatten back to vector form
         return metric.reshape(batch_size, 16)
