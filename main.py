@@ -595,7 +595,7 @@ class MetricNet(nn.Module):
         
         # Reshape to matrix form
         batch_size = coords.shape[0]
-        metric = metric_raw.reshape(batch_size, 4, 4)
+        metric = metric_raw.reshape(batch_size, 4, 4).clone()
         
         # Enforce symmetry
         if self.enforce_symmetry:
@@ -613,11 +613,11 @@ class MetricNet(nn.Module):
             metric = identity + 0.1 * metric
             
             # Additional scaling to ensure time component stays negative
-            metric[:, 0, 0] = -torch.abs(metric[:, 0, 0]) * self.time_scale
-            
-            # Ensure spatial components stay positive on diagonal
-            for i in range(1, 4):
-                metric[:, i, i] = torch.abs(metric[:, i, i]) * self.space_scale
+            diag = torch.diagonal(metric, dim1=-2, dim2=-1)
+            diag_time = -torch.abs(diag[:, 0]) * self.time_scale
+            diag_space = torch.abs(diag[:, 1:]) * self.space_scale
+            new_diag = torch.cat([diag_time.unsqueeze(-1), diag_space], dim=1)
+            metric = metric - torch.diag_embed(diag) + torch.diag_embed(new_diag)
         
         # Flatten back to vector form
         return metric.reshape(batch_size, 16)
