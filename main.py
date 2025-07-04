@@ -931,15 +931,16 @@ class PerfectFluidMatter(MatterModel):
         u_raw = self.velocity_net(coords)
         
         # Normalize to satisfy g_μν u^μ u^ν = -1
-        # Start with mostly timelike vector (avoid in-place operations to keep autograd happy)
+        # Start with mostly timelike vector without in-place operations
         spatial_part = 0.1 * torch.tanh(u_raw[:, 1:])
-        u_temp = torch.cat([torch.ones(batch_size, 1, device=device), spatial_part], dim=1)
+        time_part = torch.ones(batch_size, 1, device=device, dtype=coords.dtype)
+        u_temp = torch.cat([time_part, spatial_part], dim=1)
 
         # Compute norm
         u_norm_sq = torch.einsum('...i,...ij,...j->...', u_temp, g, u_temp)
 
-        # Normalize time component
-        time_component = torch.sqrt(-1.0 / u_norm_sq)
+        # Normalize time component (add small epsilon for numerical stability)
+        time_component = torch.sqrt(-1.0 / (torch.abs(u_norm_sq) + 1e-10))
         u = torch.cat([time_component.unsqueeze(-1), spatial_part], dim=1)
 
         return u
@@ -1293,19 +1294,23 @@ class DarkSectorMatter(MatterModel):
         batch_size = coords.shape[0]
         device = coords.device
         
-        T = torch.zeros(batch_size, 4, 4, device=device)
+        T = torch.zeros(batch_size, 4, 4, device=device, dtype=coords.dtype)
         
         # Dark matter contribution
         rho_dm = self.get_dm_density(coords)
         
         # For cold dark matter, assume comoving (u^μ = (1,0,0,0) in comoving frame)
-        u_temp = torch.zeros(batch_size, 4, device=device)
+        u_temp = torch.zeros(batch_size, 4, device=device, dtype=coords.dtype)
+        u_temp = u_temp.clone()
         u_temp[:, 0] = 1.0
 
         # Normalize four-velocity without in-place operations
         u_norm_sq = torch.einsum('...i,...ij,...j->...', u_temp, g, u_temp)
-        time_component = torch.sqrt(-1.0 / u_norm_sq)
-        u = torch.cat([time_component.unsqueeze(-1), torch.zeros(batch_size, 3, device=device)], dim=1)
+        time_component = torch.sqrt(-1.0 / (torch.abs(u_norm_sq) + 1e-10))
+
+        # Create normalized four-velocity
+        u = torch.zeros_like(u_temp)
+        u[:, 0] = time_component
 
         # Lower indices
         u_lower = torch.einsum('...ij,...j->...i', g, u)
@@ -1323,7 +1328,8 @@ class DarkSectorMatter(MatterModel):
         if self.interaction:
             Q = self.coupling_net(coords)
             # Simple phenomenological interaction: energy transfer from DE to DM
-            T *= (1.0 + 0.1 * torch.tanh(Q))
+            interaction_factor = (1.0 + 0.1 * torch.tanh(Q)).unsqueeze(-1).unsqueeze(-1)
+            T = T * interaction_factor
         
         # Ensure symmetry
         T = 0.5 * (T + T.transpose(-2, -1))
