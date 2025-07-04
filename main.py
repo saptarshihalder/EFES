@@ -1420,8 +1420,9 @@ def compute_efe_loss(
     batch_size = coords.shape[0]
     device = coords.device
     
-    # Enable gradient tracking
-    coords = coords.requires_grad_(True)
+    # Enable gradient tracking without in-place modification
+    if not coords.requires_grad:
+        coords = coords.requires_grad_(True)
     
     # Get metric from model
     g = metric_model(coords).reshape(batch_size, 4, 4)
@@ -1447,7 +1448,8 @@ def compute_efe_loss(
     
     for model, weight in zip(matter_models, matter_weights):
         T_contrib = model.get_stress_energy(coords, g, g_inv)
-        T_total += weight * T_contrib
+        # Avoid in-place addition for cleaner gradients
+        T_total = T_total + weight * T_contrib
     
     # Einstein field equations residual: G_μν - 8π T_μν
     # (Ignoring cosmological constant for now)
@@ -1597,7 +1599,7 @@ def regularized_coordinates(
     batch_size = coords.shape[0]
     device = coords.device
     
-    # Copy coordinates
+    # Create copy without modifying the original tensor
     reg_coords = coords.clone()
     spatial_coords = coords[:, 1:4]
     
@@ -1617,12 +1619,18 @@ def regularized_coordinates(
             transition = torch.sigmoid(10 * (r - min_radius))
             new_r = min_radius + transition * (r - min_radius)
             
-            # Update coordinates
+            # Update coordinates without in-place operations
             scale = new_r / (r + 1e-10)
+
+            new_spatial = spatial_coords.clone()
             for i in range(3):
-                reg_coords[need_regularization, i+1] = (
-                    center[i] + scale[need_regularization] * delta[need_regularization, i]
+                new_spatial[:, i] = torch.where(
+                    need_regularization,
+                    center[i] + scale * delta[:, i],
+                    spatial_coords[:, i]
                 )
+
+            reg_coords = torch.cat([reg_coords[:, 0:1], new_spatial], dim=1)
     
     return reg_coords
 
@@ -2253,6 +2261,41 @@ def plot_training_history(history: Dict[str, List[float]], filename: str = "trai
 
 # Example usage
 
+def enable_anomaly_detection():
+    """Enable PyTorch anomaly detection for debugging gradient issues"""
+    torch.autograd.set_detect_anomaly(True)
+    print("Anomaly detection enabled - will help identify gradient computation issues")
+
+
+def run_example_with_debug():
+    print("Running EFES Example with debug mode...")
+
+    enable_anomaly_detection()
+
+    try:
+        metric_model = create_metric_model("siren")
+        matter = create_matter_model("perfect_fluid", eos_type="linear")
+        system = GravitationalSystem(metric_model, [matter])
+
+        # Start with fewer epochs for debugging
+        history = system.train(epochs=5, batch_size=32)
+
+        coords = torch.tensor([[0.0, 5.0, 0.0, 0.0],
+                               [0.0, 10.0, 0.0, 0.0]], dtype=torch.float32)
+        results = system.evaluate(coords)
+
+        print(f"Final training loss: {history['total_loss'][-1]:.6f}")
+        print(f"Metric shape: {results['metric'].shape}")
+        print("Example completed successfully!")
+
+    except Exception as e:
+        print(f"Error during execution: {e}")
+        print("Check the traceback above for the exact location of the gradient issue")
+    finally:
+        # Disable anomaly detection
+        torch.autograd.set_detect_anomaly(False)
+
+
 def run_example():
     print("Running EFES Example...")
 
@@ -2272,5 +2315,5 @@ def run_example():
     print("Example completed successfully!")
 
 if __name__ == "__main__":
-    run_example()
+    run_example_with_debug()
 
