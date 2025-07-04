@@ -596,9 +596,6 @@ class MetricNet(nn.Module):
         batch_size = coords.shape[0]
         metric = metric_raw.reshape(batch_size, 4, 4)
         
-        # Use clone to avoid potential autograd issues with in-place ops on views
-        metric = metric_raw.reshape(batch_size, 4, 4).clone()
-        
         # Enforce symmetry
         if self.enforce_symmetry:
             metric = 0.5 * (metric + metric.transpose(-2, -1))
@@ -606,7 +603,7 @@ class MetricNet(nn.Module):
         # Enforce signature if requested
         if self.enforce_signature:
             # Start with identity matrix with correct signature
-            identity = torch.eye(4, device=coords.device)
+            identity = torch.eye(4, device=coords.device, dtype=coords.dtype)
             identity[0, 0] = -1  # Time component
             identity = identity.unsqueeze(0).expand(batch_size, -1, -1)
             
@@ -616,9 +613,12 @@ class MetricNet(nn.Module):
             
             # Re-compute diagonal using torch.diagonal for consistent gradients
             diag = torch.diagonal(metric, dim1=-2, dim2=-1)
-            diag_time = -torch.abs(diag[:, 0]) * self.time_scale
-            diag_space = torch.abs(diag[:, 1:]) * self.space_scale
-            new_diag = torch.cat([diag_time.unsqueeze(-1), diag_space], dim=1)
+
+            # Construct new diagonal values without in-place ops
+            new_diag = torch.zeros_like(diag)
+            new_diag[:, 0] = -torch.abs(diag[:, 0]) * self.time_scale
+            new_diag[:, 1:] = torch.abs(diag[:, 1:]) * self.space_scale
+
             metric = metric - torch.diag_embed(diag) + torch.diag_embed(new_diag)
         
         # Flatten back to vector form
