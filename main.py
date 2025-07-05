@@ -2282,43 +2282,9 @@ def plot_training_history(history: Dict[str, List[float]], filename: str = "trai
 
 # Example usage
 
-def enable_anomaly_detection():
-    """Enable PyTorch anomaly detection for debugging gradient issues"""
-    torch.autograd.set_detect_anomaly(True)
-    print("Anomaly detection enabled - will help identify gradient computation issues")
-
-
-def run_example_with_debug():
-    print("Running EFES Example with debug mode...")
-
-    enable_anomaly_detection()
-
-    try:
-        metric_model = create_metric_model("siren")
-        matter = create_matter_model("perfect_fluid", eos_type="linear")
-        system = GravitationalSystem(metric_model, [matter])
-
-        # Start with fewer epochs for debugging
-        history = system.train(epochs=5, batch_size=32)
-
-        coords = torch.tensor([[0.0, 5.0, 0.0, 0.0],
-                               [0.0, 10.0, 0.0, 0.0]], dtype=torch.float32)
-        results = system.evaluate(coords)
-
-        print(f"Final training loss: {history['total_loss'][-1]:.6f}")
-        print(f"Metric shape: {results['metric'].shape}")
-        print("Example completed successfully!")
-
-    except Exception as e:
-        print(f"Error during execution: {e}")
-        print("Check the traceback above for the exact location of the gradient issue")
-    finally:
-        # Disable anomaly detection
-        torch.autograd.set_detect_anomaly(False)
-
-
-def run_example():
-    print("Running EFES Example...")
+def main() -> None:
+    """Run a basic training session for EFES."""
+    print("Running EFES training...")
 
     # Use conservative model config
     model_config = ModelConfig(
@@ -2362,8 +2328,8 @@ def run_example():
 
     print(f"Final training loss: {history['total_loss'][-1]:.6f}")
     print(f"Metric shape: {results['metric'].shape}")
-    print("Example completed successfully!")
+    print("Training completed successfully!")
 
 if __name__ == "__main__":
-    run_example_with_debug()
+    main()
 
