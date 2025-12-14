@@ -64,7 +64,17 @@ class GRGeometry:
     """
     @staticmethod
     def get_inverse_metric(g):
-        return torch.inverse(g)
+        """Compute inverse metric with regularization to prevent singular matrices."""
+        # Add small regularization to diagonal for numerical stability
+        B = g.shape[0]
+        reg = 1e-6 * torch.eye(4, device=g.device).unsqueeze(0).expand(B, -1, -1)
+        g_reg = g + reg
+        try:
+            return torch.inverse(g_reg)
+        except RuntimeError as e:
+            # Fallback: use pseudoinverse if regular inverse fails
+            print(f"Warning: Matrix inversion failed, using pseudoinverse. Error: {e}")
+            return torch.linalg.pinv(g_reg)
 
     @staticmethod
     def christoffel_symbols(g, coords):
@@ -240,6 +250,17 @@ def time_dependence_penalty(metric_4d, coords_4d):
 def momentum_constraint(theta, coords_spatial):
     return torch.mean(theta**2)
 
+def boundary_loss(spatial_metric, coords_spatial):
+    """Penalizes deviation from Minkowski metric at large radii (asymptotic flatness)."""
+    r = torch.sqrt(torch.sum(coords_spatial**2, dim=1, keepdim=True))
+    # At large r, spatial metric should approach identity
+    identity = torch.eye(3, device=spatial_metric.device).unsqueeze(0).expand(spatial_metric.shape[0], -1, -1)
+    # Weight by 1/r to focus on boundary regions
+    weight = torch.exp(-r / 2.0)  # Exponential weight favoring outer regions
+    deviation = torch.mean((spatial_metric - identity)**2, dim=(1, 2), keepdim=True)
+    loss = torch.mean(weight * deviation)
+    return loss
+
 # --- 4. Feature Extraction & Surrogate Model ---
 
 def extract_features(coords, lapse, rho, G_res_norm):
@@ -310,8 +331,8 @@ class ActiveSearchPolicy:
 
     def train(self):
         if len(self.history_X) < 5: return
-        
-        X = torch.stack(self.history_X)
+
+        X = torch.stack(self.history_X).to(device)
         y = torch.tensor(self.history_y, dtype=torch.float32).unsqueeze(1).to(device)
         
         # Simple training loop
@@ -411,6 +432,7 @@ class GravitySimulator:
             loss_static = time_dependence_penalty(metric_4d, coords_4d)
             theta = DifferentialGeometry.expansion_scalar(shift, coords_spatial)
             loss_momentum = momentum_constraint(theta, coords_spatial)
+            loss_boundary = boundary_loss(spatial_metric, coords_spatial)
 
             # Topology Shaping (Uses config lambda_topology)
             R_spatial = DifferentialGeometry.ricci_scalar(spatial_metric, coords_spatial)
@@ -587,9 +609,17 @@ class ExperimentRunner:
                 # High Interest = Valid Physics (Low Res) AND Novel
                 # Score = Novelty / (1 + Residual_Penalty)
                 interest_score = novelty_score / (1.0 + np.log1p(G_res_norm * 10.0))
-                
+
+                # Full hyperparam vector actually used in this run
+                full_params = {
+                    'exotic_rho_0': run_config.exotic_rho_0,
+                    'lambda_topology': run_config.lambda_topology,
+                    'domain_radius': run_config.domain_radius,
+                    'omega_0': run_config.omega_0,
+                }
+
                 # Update Policy
-                policy.update_history(spec['hyperparams'], interest_score)
+                policy.update_history(full_params, interest_score)
                 
                 classification = self.classify_topology(lapse_np, shift_np, rho_np)
                 
@@ -597,7 +627,7 @@ class ExperimentRunner:
                 entry = {
                     "id": f"active_{r}_{i}",
                     "mode": mode,
-                    "hyperparams": spec['hyperparams'],
+                    "hyperparams": full_params,
                     "G_res_norm": G_res_norm,
                     "novelty": novelty_score,
                     "interest": interest_score,
