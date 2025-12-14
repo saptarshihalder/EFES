@@ -64,7 +64,17 @@ class GRGeometry:
     """
     @staticmethod
     def get_inverse_metric(g):
-        return torch.inverse(g)
+        """Compute inverse metric with regularization to prevent singular matrices."""
+        # Add small regularization to diagonal for numerical stability
+        B = g.shape[0]
+        reg = 1e-6 * torch.eye(4, device=g.device).unsqueeze(0).expand(B, -1, -1)
+        g_reg = g + reg
+        try:
+            return torch.inverse(g_reg)
+        except RuntimeError as e:
+            # Fallback: use pseudoinverse if regular inverse fails
+            print(f"Warning: Matrix inversion failed, using pseudoinverse. Error: {e}")
+            return torch.linalg.pinv(g_reg)
 
     @staticmethod
     def christoffel_symbols(g, coords):
