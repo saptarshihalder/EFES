@@ -321,8 +321,8 @@ class ActiveSearchPolicy:
 
     def train(self):
         if len(self.history_X) < 5: return
-        
-        X = torch.stack(self.history_X)
+
+        X = torch.stack(self.history_X).to(device)
         y = torch.tensor(self.history_y, dtype=torch.float32).unsqueeze(1).to(device)
         
         # Simple training loop
@@ -599,9 +599,17 @@ class ExperimentRunner:
                 # High Interest = Valid Physics (Low Res) AND Novel
                 # Score = Novelty / (1 + Residual_Penalty)
                 interest_score = novelty_score / (1.0 + np.log1p(G_res_norm * 10.0))
-                
+
+                # Full hyperparam vector actually used in this run
+                full_params = {
+                    'exotic_rho_0': run_config.exotic_rho_0,
+                    'lambda_topology': run_config.lambda_topology,
+                    'domain_radius': run_config.domain_radius,
+                    'omega_0': run_config.omega_0,
+                }
+
                 # Update Policy
-                policy.update_history(spec['hyperparams'], interest_score)
+                policy.update_history(full_params, interest_score)
                 
                 classification = self.classify_topology(lapse_np, shift_np, rho_np)
                 
@@ -609,7 +617,7 @@ class ExperimentRunner:
                 entry = {
                     "id": f"active_{r}_{i}",
                     "mode": mode,
-                    "hyperparams": spec['hyperparams'],
+                    "hyperparams": full_params,
                     "G_res_norm": G_res_norm,
                     "novelty": novelty_score,
                     "interest": interest_score,
