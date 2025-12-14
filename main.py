@@ -240,6 +240,17 @@ def time_dependence_penalty(metric_4d, coords_4d):
 def momentum_constraint(theta, coords_spatial):
     return torch.mean(theta**2)
 
+def boundary_loss(spatial_metric, coords_spatial):
+    """Penalizes deviation from Minkowski metric at large radii (asymptotic flatness)."""
+    r = torch.sqrt(torch.sum(coords_spatial**2, dim=1, keepdim=True))
+    # At large r, spatial metric should approach identity
+    identity = torch.eye(3, device=spatial_metric.device).unsqueeze(0).expand(spatial_metric.shape[0], -1, -1)
+    # Weight by 1/r to focus on boundary regions
+    weight = torch.exp(-r / 2.0)  # Exponential weight favoring outer regions
+    deviation = torch.mean((spatial_metric - identity)**2, dim=(1, 2), keepdim=True)
+    loss = torch.mean(weight * deviation)
+    return loss
+
 # --- 4. Feature Extraction & Surrogate Model ---
 
 def extract_features(coords, lapse, rho, G_res_norm):
@@ -411,6 +422,7 @@ class GravitySimulator:
             loss_static = time_dependence_penalty(metric_4d, coords_4d)
             theta = DifferentialGeometry.expansion_scalar(shift, coords_spatial)
             loss_momentum = momentum_constraint(theta, coords_spatial)
+            loss_boundary = boundary_loss(spatial_metric, coords_spatial)
 
             # Topology Shaping (Uses config lambda_topology)
             R_spatial = DifferentialGeometry.ricci_scalar(spatial_metric, coords_spatial)
