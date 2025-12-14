@@ -1,1431 +1,663 @@
-#!/usr/bin/env python3
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-from mpl_toolkits.mplot3d import Axes3D
-import seaborn as sns
-from typing import Dict, List, Tuple, Optional, Union, Callable, Any
-from dataclasses import dataclass, field
-from abc import ABC, abstractmethod
+import copy
 import time
-import warnings
-warnings.filterwarnings('ignore')
+import pandas as pd
 
-# Set style for publication-quality plots
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
+# --- Configuration ---
+class HyperParameters:
+    def __init__(self):
+        self.domain_radius = 3.0
+        self.hidden_dim = 64
+        self.omega_0 = 30.0  # SIREN frequency
+        self.learning_rate = 1e-4
+        self.batch_size = 1024
+        self.epochs = 800 # Reduced for active learning speed
+        
+        # Loss weights
+        self.lambda_hamiltonian = 1.0  # Physics (Einstein)
+        self.lambda_momentum = 1.0     # Momentum constraint
+        self.lambda_boundary = 5.0     # Asymptotic flatness
+        self.lambda_topology = 10.0    # Forcing shape (warp/wormhole)
+        self.lambda_complexity = 0.1   # Regularization
+        self.lambda_static = 0.1       # Penalty for time dependence
+        self.lambda_signature = 0.1    # Enforce g00 < 0
+        self.lambda_determinant = 1.0  # Prevent det(g) near 0
+        
+        # Physics Parameters (Meta-learnable)
+        self.exotic_rho_0 = -0.1       # Density for exotic matter
+        self.verbose = False           # Less print noise for active loop
+
+    def update(self, **kwargs):
+        """Update params from a dictionary."""
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+            else:
+                pass # Ignore unknown params for now
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Running on device: {device}")
+
+# --- Helper: Derivatives ---
+def diff(y, x):
+    """Compute dy/dx using torch autograd."""
+    grad_outputs = torch.ones_like(y)
+    grad = torch.autograd.grad(
+        outputs=y,
+        inputs=x,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    return grad
+
+# --- 1. Differential Geometry Engines (4D and 3D) ---
+
+class GRGeometry:
+    """
+    Handles full 4D Differential Geometry calculations.
+    """
+    @staticmethod
+    def get_inverse_metric(g):
+        return torch.inverse(g)
+
+    @staticmethod
+    def christoffel_symbols(g, coords):
+        B, D, _ = g.shape
+        g_inv = GRGeometry.get_inverse_metric(g)
+        g_flat = g.view(B, -1)
+        dg_dcoords = []
+        for i in range(D * D):
+            dg_dcoords.append(diff(g_flat[:, i].unsqueeze(1), coords))
+        dg_dx = torch.stack(dg_dcoords, dim=1).view(B, D, D, D)
+        
+        gamma = torch.zeros(B, D, D, D, device=g.device)
+        for i in range(D):
+            for j in range(D):
+                for k in range(D):
+                    term = 0.0
+                    for l in range(D):
+                        term += 0.5 * g_inv[:, k, l] * (
+                            dg_dx[:, i, l, j] + 
+                            dg_dx[:, j, l, i] - 
+                            dg_dx[:, i, j, l]
+                        )
+                    gamma[:, k, i, j] = term
+        return gamma
+
+    @staticmethod
+    def ricci_tensor(g, coords):
+        gamma = GRGeometry.christoffel_symbols(g, coords)
+        B, D, _, _ = gamma.shape
+        gamma_flat = gamma.view(B, -1)
+        dgamma_dcoords = []
+        for i in range(D**3):
+            dgamma_dcoords.append(diff(gamma_flat[:, i].unsqueeze(1), coords))
+        dgamma_dx = torch.stack(dgamma_dcoords, dim=1).view(B, D, D, D, D)
+        
+        R_uv = torch.zeros(B, D, D, device=g.device)
+        for u in range(D):
+            for v in range(D):
+                t1 = 0; t2 = 0; t3 = 0; t4 = 0
+                for a in range(D):
+                    t1 += dgamma_dx[:, a, u, a, v]
+                    t2 += dgamma_dx[:, a, u, v, a]
+                    for b in range(D):
+                        t3 += gamma[:, a, b, a] * gamma[:, b, u, v]
+                        t4 += gamma[:, a, b, v] * gamma[:, b, u, a]
+                R_uv[:, u, v] = t1 - t2 + t3 - t4
+        return R_uv
+
+    @staticmethod
+    def einstein_tensor(g, coords):
+        R_uv = GRGeometry.ricci_tensor(g, coords)
+        g_inv = GRGeometry.get_inverse_metric(g)
+        R_scalar = torch.einsum('bij,bij->b', g_inv, R_uv).unsqueeze(1).unsqueeze(2)
+        G_uv = R_uv - 0.5 * R_scalar * g
+        return G_uv
 
 
-# ============================================================================
-# CONFIGURATION CLASSES
-# ============================================================================
+class DifferentialGeometry:
+    """Helper for 3D spatial slices (used for topology shaping/constraints)."""
+    @staticmethod
+    def expansion_scalar(shift, coords_spatial):
+        div = 0
+        for i in range(3):
+            grad = diff(shift[:, i].unsqueeze(1), coords_spatial)
+            div += grad[:, i]
+        return div.unsqueeze(1)
 
-@dataclass
-class NetworkConfig:
-    """Configuration for neural network architecture."""
-    hidden_dim: int = 256
-    num_layers: int = 6
-    activation: str = "sine"
-    omega_0: float = 30.0
-    use_fourier: bool = True
-    fourier_scale: float = 10.0
-    num_fourier: int = 128
-    dropout: float = 0.0
-    use_residual: bool = True
+    @staticmethod
+    def ricci_scalar(spatial_metric, coords_spatial):
+        R_proxy = torch.zeros(spatial_metric.shape[0], 1, device=spatial_metric.device)
+        for i in range(3):
+            comp = spatial_metric[:, i, i].unsqueeze(1)
+            grads = diff(comp, coords_spatial)
+            laplacian = 0
+            for k in range(3):
+                laplacian += diff(grads[:, k].unsqueeze(1), coords_spatial)[:, k]
+            R_proxy += laplacian.unsqueeze(1)
+        return R_proxy
 
-
-@dataclass
-class ADMConfig:
-    """Configuration for ADM decomposition."""
-    enforce_hamiltonian: bool = True
-    enforce_momentum: bool = True
-    gauge_condition: str = "harmonic"  # harmonic, maximal_slicing, geodesic
-    hamiltonian_weight: float = 10.0
-    momentum_weight: float = 5.0
-    gauge_weight: float = 1.0
-    epsilon: float = 1e-8
-
-
-@dataclass
-class TrainingConfig:
-    """Configuration for training process."""
-    epochs: int = 1000
-    batch_size: int = 512
-    lr_initial: float = 1e-4
-    lr_decay: float = 0.95
-    decay_every: int = 100
-    curriculum_stages: int = 5
-    adaptive_sampling: bool = True
-    resample_every: int = 50
-    grad_clip: float = 1.0
-    early_stopping_patience: int = 100
-    checkpoint_every: int = 50
-
-
-@dataclass
-class BreakthroughConfig:
-    """Configuration for breakthrough detection."""
-    enabled: bool = True
-    novelty_threshold: float = 2.5
-    stability_threshold: float = 0.1
-    energy_violation_threshold: float = 0.05
-    check_every: int = 10
-    history_window: int = 50
-
-
-@dataclass
-class VisualizationConfig:
-    """Configuration for visualization."""
-    plot_every: int = 100
-    resolution: int = 50
-    spatial_extent: float = 20.0
-    save_plots: bool = True
-    dpi: int = 150
-    figsize: Tuple[int, int] = (20, 12)
-
-
-# ============================================================================
-# ADVANCED NEURAL NETWORK ARCHITECTURES
-# ============================================================================
+# --- 2. Neural Network Architecture ---
 
 class SineLayer(nn.Module):
-    """Sine activation with learnable frequency."""
-    
-    def __init__(self, omega_0: float = 30.0, learnable: bool = True):
+    def __init__(self, in_features, out_features, omega_0=30.0, is_first=False):
         super().__init__()
-        if learnable:
-            self.omega = nn.Parameter(torch.tensor(omega_0))
-        else:
-            self.register_buffer('omega', torch.tensor(omega_0))
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.linear = nn.Linear(in_features, out_features)
+        self.init_weights()
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sin(self.omega * x)
-
-
-class FourierFeatureLayer(nn.Module):
-    """Random Fourier features for better high-frequency representation."""
-    
-    def __init__(self, in_dim: int, num_features: int, scale: float = 10.0):
-        super().__init__()
-        B = torch.randn(in_dim, num_features) * scale
-        self.register_buffer('B', B)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_proj = 2 * np.pi * x @ self.B
-        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-
-
-class ResidualBlock(nn.Module):
-    """Residual block for deep networks."""
-    
-    def __init__(self, dim: int, activation: nn.Module):
-        super().__init__()
-        self.linear1 = nn.Linear(dim, dim)
-        self.linear2 = nn.Linear(dim, dim)
-        self.activation = activation
-        self.norm = nn.LayerNorm(dim)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-        x = self.norm(x + residual)
-        return x
-
-
-class AdvancedSIREN(nn.Module):
-    """
-    Advanced SIREN architecture with Fourier features and residual connections.
-    Designed for learning complex spacetime geometries.
-    """
-    
-    def __init__(self, in_dim: int, out_dim: int, config: NetworkConfig):
-        super().__init__()
-        self.config = config
-        
-        # Fourier feature encoding
-        if config.use_fourier:
-            self.fourier = FourierFeatureLayer(in_dim, config.num_fourier, config.fourier_scale)
-            effective_in_dim = 2 * config.num_fourier
-        else:
-            self.fourier = None
-            effective_in_dim = in_dim
-        
-        # Input layer
-        self.input_layer = nn.Linear(effective_in_dim, config.hidden_dim)
-        
-        # Hidden layers with optional residual connections
-        self.hidden_layers = nn.ModuleList()
-        for i in range(config.num_layers):
-            if config.use_residual and i > 0:
-                self.hidden_layers.append(
-                    ResidualBlock(config.hidden_dim, SineLayer(config.omega_0))
-                )
-            else:
-                self.hidden_layers.append(nn.Linear(config.hidden_dim, config.hidden_dim))
-        
-        # Output layer
-        self.output_layer = nn.Linear(config.hidden_dim, out_dim)
-        
-        # Activation
-        self.activation = SineLayer(config.omega_0, learnable=True)
-        
-        # Dropout
-        self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else None
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        """SIREN-style weight initialization."""
+    def init_weights(self):
         with torch.no_grad():
-            # First layer
-            if self.fourier is None:
-                self.input_layer.weight.uniform_(-1, 1)
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.linear.in_features, 
+                                             1 / self.linear.in_features)
             else:
-                n = self.fourier.B.shape[1] * 2
-                self.input_layer.weight.uniform_(
-                    -np.sqrt(6 / n) / self.config.omega_0,
-                    np.sqrt(6 / n) / self.config.omega_0
-                )
-            
-            # Hidden layers
-            for layer in self.hidden_layers:
-                if isinstance(layer, nn.Linear):
-                    layer.weight.uniform_(
-                        -np.sqrt(6 / self.config.hidden_dim) / self.config.omega_0,
-                        np.sqrt(6 / self.config.hidden_dim) / self.config.omega_0
-                    )
-            
-            # Output layer
-            self.output_layer.weight.uniform_(
-                -np.sqrt(6 / self.config.hidden_dim),
-                np.sqrt(6 / self.config.hidden_dim)
-            )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Fourier features
-        if self.fourier is not None:
-            x = self.fourier(x)
+                self.linear.weight.uniform_(-np.sqrt(6 / self.linear.in_features) / self.omega_0, 
+                                             np.sqrt(6 / self.linear.in_features) / self.omega_0)
         
-        # Input layer
-        x = self.input_layer(x)
-        x = self.activation(x)
-        
-        # Hidden layers
-        for layer in self.hidden_layers:
-            if isinstance(layer, ResidualBlock):
-                x = layer(x)
-            else:
-                x = layer(x)
-                x = self.activation(x)
-                if self.dropout is not None:
-                    x = self.dropout(x)
-        
-        # Output layer (no activation)
-        x = self.output_layer(x)
-        return x
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
 
-
-# ============================================================================
-# ADM DECOMPOSITION NETWORKS
-# ============================================================================
-
-class ADMNetwork(nn.Module):
-    """
-    Neural network for ADM variables: lapse (α), shift (β^i), 
-    spatial metric (γ_ij), and extrinsic curvature (K_ij).
-    """
-    
-    def __init__(self, config: NetworkConfig):
+class MetricEstimator(nn.Module):
+    def __init__(self, config: HyperParameters):
         super().__init__()
-        self.config = config
-        
-        # Separate networks for each ADM variable
-        # 4D input: (t, x, y, z)
-        self.lapse_net = AdvancedSIREN(4, 1, config)  # α: scalar
-        self.shift_net = AdvancedSIREN(4, 3, config)  # β^i: 3-vector
-        self.metric_net = AdvancedSIREN(4, 6, config)  # γ_ij: symmetric 3x3 (6 independent)
-        self.extrinsic_net = AdvancedSIREN(4, 6, config)  # K_ij: symmetric 3x3
-        
-        # Learnable scale parameters for physical constraints
-        self.lapse_scale = nn.Parameter(torch.tensor(1.0))
-        self.shift_scale = nn.Parameter(torch.tensor(0.1))
-        self.metric_scale = nn.Parameter(torch.tensor(1.0))
-        self.K_scale = nn.Parameter(torch.tensor(0.1))
-    
-    def forward(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            coords: (batch, 4) tensor of (t, x, y, z)
-        
-        Returns:
-            Dictionary containing ADM variables
-        """
-        batch_size = coords.shape[0]
-        device = coords.device
-        
-        # Lapse function (must be positive)
-        lapse_raw = self.lapse_net(coords)
-        lapse = F.softplus(lapse_raw * self.lapse_scale) + 0.1
-        
-        # Shift vector
-        shift = self.shift_net(coords) * self.shift_scale
-        
-        # Spatial metric (must be positive definite)
-        metric_raw = self.metric_net(coords)
-        # Construct symmetric 3x3 matrix
-        gamma = self._construct_symmetric_matrix(metric_raw, batch_size, device)
-        # Ensure positive definiteness
-        gamma = self._ensure_positive_definite(gamma)
-        
-        # Extrinsic curvature (symmetric, traceless encouraged)
-        K_raw = self.extrinsic_net(coords)
-        K = self._construct_symmetric_matrix(K_raw, batch_size, device) * self.K_scale
-        
-        return {
-            'lapse': lapse.squeeze(-1),  # (batch,)
-            'shift': shift,  # (batch, 3)
-            'gamma': gamma,  # (batch, 3, 3)
-            'K': K  # (batch, 3, 3)
-        }
-    
-    def _construct_symmetric_matrix(self, vec: torch.Tensor, batch_size: int, 
-                                   device: torch.device) -> torch.Tensor:
-        """Construct symmetric 3x3 matrix from 6-component vector."""
-        mat = torch.zeros(batch_size, 3, 3, device=device)
-        # Upper triangular part
-        mat[:, 0, 0] = vec[:, 0]
-        mat[:, 0, 1] = vec[:, 1]
-        mat[:, 0, 2] = vec[:, 2]
-        mat[:, 1, 1] = vec[:, 3]
-        mat[:, 1, 2] = vec[:, 4]
-        mat[:, 2, 2] = vec[:, 5]
-        # Mirror to lower triangular
-        mat[:, 1, 0] = mat[:, 0, 1]
-        mat[:, 2, 0] = mat[:, 0, 2]
-        mat[:, 2, 1] = mat[:, 1, 2]
-        return mat
-    
-    def _ensure_positive_definite(self, gamma: torch.Tensor, 
-                                  epsilon: float = 0.01) -> torch.Tensor:
-        """Ensure spatial metric is positive definite via eigenvalue modification."""
-        # Start with identity
-        batch_size = gamma.shape[0]
-        device = gamma.device
-        identity = torch.eye(3, device=device).unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Add identity and scale
-        gamma = identity + 0.5 * gamma
-        
-        # Ensure positive diagonal
-        diag = torch.diagonal(gamma, dim1=-2, dim2=-1)
-        gamma = gamma - torch.diag_embed(diag) + torch.diag_embed(torch.abs(diag) + epsilon)
-        
-        return gamma
-    
-    def get_4d_metric(self, adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Reconstruct 4D metric from ADM variables."""
-        batch_size = adm_vars['lapse'].shape[0]
-        device = adm_vars['lapse'].device
-        
-        alpha = adm_vars['lapse'].unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
-        beta = adm_vars['shift']  # (batch, 3)
-        gamma = adm_vars['gamma']  # (batch, 3, 3)
-        
-        # Build 4D metric
-        g = torch.zeros(batch_size, 4, 4, device=device)
-        
-        # g_00 = -α² + β_i β^i
-        beta_squared = torch.einsum('bi,bij,bj->b', beta, gamma, beta)
-        g[:, 0, 0] = -alpha.squeeze(-1).squeeze(-1)**2 + beta_squared
-        
-        # g_0i = β_i
-        g[:, 0, 1:4] = torch.einsum('bij,bj->bi', gamma, beta)
-        g[:, 1:4, 0] = g[:, 0, 1:4]
-        
-        # g_ij = γ_ij
-        g[:, 1:4, 1:4] = gamma
-        
-        return g
-
-
-# ============================================================================
-# MATTER MODELS
-# ============================================================================
-
-class MatterField(nn.Module, ABC):
-    """Abstract base class for matter fields."""
-    
-    @abstractmethod
-    def stress_energy_tensor(self, coords: torch.Tensor, 
-                            adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute stress-energy tensor T_μν."""
-        pass
-    
-    @abstractmethod
-    def energy_density(self, coords: torch.Tensor, 
-                      adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute energy density ρ."""
-        pass
-    
-    @abstractmethod
-    def momentum_density(self, coords: torch.Tensor, 
-                        adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute momentum density j^i."""
-        pass
-
-
-class ScalarField(MatterField):
-    """Scalar field matter (e.g., inflaton, quintessence)."""
-    
-    def __init__(self, config: NetworkConfig, mass: float = 1.0, 
-                 potential_type: str = "quadratic"):
-        super().__init__()
-        self.field_net = AdvancedSIREN(4, 1, config)
-        self.mass = nn.Parameter(torch.tensor(mass))
-        self.potential_type = potential_type
-        
-        if potential_type == "quartic":
-            self.lambda_coupling = nn.Parameter(torch.tensor(0.1))
-    
-    def potential(self, phi: torch.Tensor) -> torch.Tensor:
-        """Scalar potential V(φ)."""
-        if self.potential_type == "quadratic":
-            return 0.5 * self.mass**2 * phi**2
-        elif self.potential_type == "quartic":
-            return 0.5 * self.mass**2 * phi**2 + 0.25 * self.lambda_coupling * phi**4
-        else:
-            return torch.zeros_like(phi)
-    
-    def stress_energy_tensor(self, coords: torch.Tensor, 
-                            adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute T_μν for scalar field."""
-        batch_size = coords.shape[0]
-        device = coords.device
-        
-        # Enable gradients
-        coords = coords.requires_grad_(True)
-        phi = self.field_net(coords)
-        
-        # Compute derivatives
-        grad_phi = torch.autograd.grad(phi.sum(), coords, create_graph=True)[0]
-        
-        # Get 4D metric
-        g = ADMNetwork.get_4d_metric(self, adm_vars)
-        g_inv = self._safe_inverse(g)
-        
-        # Kinetic term: ½ g^μν ∂_μφ ∂_νφ
-        kinetic = 0.5 * torch.einsum('bij,bi,bj->b', g_inv, grad_phi, grad_phi)
-        
-        # Potential
-        V = self.potential(phi.squeeze(-1))
-        
-        # T_μν = ∂_μφ ∂_νφ - g_μν[½ ∂φ² - V]
-        T = torch.zeros(batch_size, 4, 4, device=device)
-        for mu in range(4):
-            for nu in range(4):
-                T[:, mu, nu] = grad_phi[:, mu] * grad_phi[:, nu]
-        
-        lagrangian = kinetic - V
-        T = T - torch.einsum('b,bij->bij', lagrangian, g)
-        
-        return T
-    
-    def energy_density(self, coords: torch.Tensor, 
-                      adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Energy density for Hamiltonian constraint."""
-        coords = coords.requires_grad_(True)
-        phi = self.field_net(coords)
-        grad_phi = torch.autograd.grad(phi.sum(), coords, create_graph=True)[0]
-        
-        # π = ∂_t φ / α (conjugate momentum)
-        alpha = adm_vars['lapse']
-        pi = grad_phi[:, 0] / alpha
-        
-        # Spatial gradient
-        gamma_inv = self._safe_inverse(adm_vars['gamma'])
-        grad_phi_spatial = grad_phi[:, 1:4]
-        
-        # ρ = ½ π² + ½ γ^ij ∂_i φ ∂_j φ + V(φ)
-        rho = (0.5 * pi**2 + 
-               0.5 * torch.einsum('bij,bi,bj->b', gamma_inv, grad_phi_spatial, grad_phi_spatial) +
-               self.potential(phi.squeeze(-1)))
-        
-        return rho
-    
-    def momentum_density(self, coords: torch.Tensor, 
-                        adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Momentum density for momentum constraint."""
-        coords = coords.requires_grad_(True)
-        phi = self.field_net(coords)
-        grad_phi = torch.autograd.grad(phi.sum(), coords, create_graph=True)[0]
-        
-        alpha = adm_vars['lapse']
-        pi = grad_phi[:, 0] / alpha
-        grad_phi_spatial = grad_phi[:, 1:4]
-        
-        # j^i = π ∂^i φ
-        gamma_inv = self._safe_inverse(adm_vars['gamma'])
-        j = pi.unsqueeze(-1) * torch.einsum('bij,bj->bi', gamma_inv, grad_phi_spatial)
-        
-        return j
-    
-    def _safe_inverse(self, matrix: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-        """Stable matrix inversion using SVD."""
-        U, S, Vh = torch.linalg.svd(matrix)
-        S_inv = torch.where(S > epsilon, 1.0 / S, 1.0 / epsilon)
-        return torch.matmul(Vh.transpose(-2, -1), 
-                           torch.matmul(torch.diag_embed(S_inv), U.transpose(-2, -1)))
-
-
-class PerfectFluid(MatterField):
-    """Perfect fluid matter with equation of state."""
-    
-    def __init__(self, config: NetworkConfig, w: float = 0.0):
-        super().__init__()
-        self.density_net = AdvancedSIREN(4, 1, config)
-        self.velocity_net = AdvancedSIREN(4, 3, config)
-        self.w = nn.Parameter(torch.tensor(w))  # p = w * ρ
-    
-    def stress_energy_tensor(self, coords: torch.Tensor, 
-                            adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Perfect fluid T_μν = (ρ + p)u_μ u_ν + p g_μν."""
-        batch_size = coords.shape[0]
-        device = coords.device
-        
-        # Energy density (ensure positive)
-        rho = F.softplus(self.density_net(coords).squeeze(-1)) + 1e-6
-        
-        # Pressure
-        p = self.w * rho
-        
-        # 4-velocity (normalized)
-        v_spatial = 0.1 * torch.tanh(self.velocity_net(coords))
-        u = self._normalize_4velocity(v_spatial, adm_vars)
-        
-        # Get metric
-        g = ADMNetwork.get_4d_metric(self, adm_vars)
-        
-        # Lower indices
-        u_lower = torch.einsum('bij,bj->bi', g, u)
-        
-        # T_μν
-        T = torch.einsum('b,bi,bj->bij', rho + p, u_lower, u_lower)
-        T = T + torch.einsum('b,bij->bij', p, g)
-        
-        return T
-    
-    def energy_density(self, coords: torch.Tensor, 
-                      adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        rho = F.softplus(self.density_net(coords).squeeze(-1)) + 1e-6
-        return rho
-    
-    def momentum_density(self, coords: torch.Tensor, 
-                        adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        rho = self.energy_density(coords, adm_vars)
-        p = self.w * rho
-        v_spatial = 0.1 * torch.tanh(self.velocity_net(coords))
-        
-        # j^i = (ρ + p) γ^{ij} v_j
-        gamma_inv = self._safe_inverse(adm_vars['gamma'])
-        j = torch.einsum('b,bij,bj->bi', rho + p, gamma_inv, v_spatial)
-        
-        return j
-    
-    def _normalize_4velocity(self, v_spatial: torch.Tensor, 
-                            adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Normalize 4-velocity to satisfy g_μν u^μ u^ν = -1."""
-        batch_size = v_spatial.shape[0]
-        device = v_spatial.device
-        
-        gamma = adm_vars['gamma']
-        alpha = adm_vars['lapse']
-        
-        # u^0 = 1/(α√(1 - v²))
-        v_squared = torch.einsum('bij,bi,bj->b', gamma, v_spatial, v_spatial)
-        gamma_lorentz = 1.0 / torch.sqrt(1.0 - v_squared.clamp(max=0.99))
-        u_0 = gamma_lorentz / alpha
-        
-        # u^i = γ^{ij} v_j / α
-        gamma_inv = self._safe_inverse(gamma)
-        u_spatial = torch.einsum('bij,bj->bi', gamma_inv, v_spatial) * gamma_lorentz.unsqueeze(-1) / alpha.unsqueeze(-1)
-        
-        return torch.cat([u_0.unsqueeze(-1), u_spatial], dim=-1)
-    
-    def _safe_inverse(self, matrix: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-        U, S, Vh = torch.linalg.svd(matrix)
-        S_inv = torch.where(S > epsilon, 1.0 / S, 1.0 / epsilon)
-        return torch.matmul(Vh.transpose(-2, -1), 
-                           torch.matmul(torch.diag_embed(S_inv), U.transpose(-2, -1)))
-
-
-# ============================================================================
-# 3+1 ADM PHYSICS CONSTRAINTS
-# ============================================================================
-
-class ADMPhysics:
-    """Physics-informed constraints for ADM decomposition."""
-    
-    def __init__(self, config: ADMConfig):
-        self.config = config
-    
-    def hamiltonian_constraint(self, coords: torch.Tensor, 
-                              adm_vars: Dict[str, torch.Tensor],
-                              matter: Optional[MatterField] = None) -> torch.Tensor:
-        """
-        Hamiltonian constraint: H = R + K² - K_ij K^ij - 16π ρ = 0
-        where R is the 3D Ricci scalar, K is the trace of extrinsic curvature.
-        """
-        gamma = adm_vars['gamma']
-        K = adm_vars['K']
-        
-        # Inverse metric
-        gamma_inv = self._safe_inverse(gamma)
-        
-        # Trace of K
-        K_trace = torch.einsum('bij,bij->b', gamma_inv, K)
-        
-        # K_ij K^ij
-        K_squared = torch.einsum('bij,bikl,bkl->b', 
-                                K, 
-                                torch.einsum('bik,bjl->bijkl', gamma_inv, gamma_inv), 
-                                K)
-        
-        # 3D Ricci scalar (approximated for efficiency)
-        R_3d = self._compute_ricci_scalar_3d(coords, gamma, gamma_inv)
-        
-        # Matter contribution
-        if matter is not None:
-            rho = matter.energy_density(coords, adm_vars)
-        else:
-            rho = torch.zeros_like(K_trace)
-        
-        # Hamiltonian constraint
-        H = R_3d + K_trace**2 - K_squared - 16 * np.pi * rho
-        
-        return H
-    
-    def momentum_constraint(self, coords: torch.Tensor, 
-                           adm_vars: Dict[str, torch.Tensor],
-                           matter: Optional[MatterField] = None) -> torch.Tensor:
-        """
-        Momentum constraint: M^i = D_j(K^ij - γ^ij K) - 8π j^i = 0
-        where D_j is the covariant derivative.
-        """
-        gamma = adm_vars['gamma']
-        K = adm_vars['K']
-        gamma_inv = self._safe_inverse(gamma)
-        
-        # K^ij
-        K_up = torch.einsum('bik,bjl,bkl->bij', gamma_inv, gamma_inv, K)
-        
-        # Trace K
-        K_trace = torch.einsum('bij,bij->b', gamma_inv, K)
-        
-        # K^ij - γ^ij K
-        M_term = K_up - torch.einsum('b,bij->bij', K_trace, gamma_inv)
-        
-        # Simplified divergence (full version requires Christoffel symbols)
-        # For demonstration, we use a finite difference approximation
-        M = torch.zeros(coords.shape[0], 3, device=coords.device)
-        
-        # Matter momentum
-        if matter is not None:
-            j = matter.momentum_density(coords, adm_vars)
-            M = M - 8 * np.pi * j
-        
-        return M
-    
-    def gauge_condition(self, coords: torch.Tensor, 
-                       adm_vars: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Enforce gauge conditions:
-        - Harmonic gauge: □x^μ = 0
-        - Maximal slicing: K = 0
-        - Geodesic slicing: ∂_t α = 0
-        """
-        if self.config.gauge_condition == "maximal_slicing":
-            # Maximal slicing: enforce K = 0
-            gamma_inv = self._safe_inverse(adm_vars['gamma'])
-            K_trace = torch.einsum('bij,bij->b', gamma_inv, adm_vars['K'])
-            return K_trace
-        
-        elif self.config.gauge_condition == "harmonic":
-            # Harmonic gauge (simplified)
-            alpha = adm_vars['lapse']
-            return torch.zeros_like(alpha)  # Placeholder
-        
-        else:
-            return torch.zeros(coords.shape[0], device=coords.device)
-    
-    def _compute_ricci_scalar_3d(self, coords: torch.Tensor, 
-                                 gamma: torch.Tensor,
-                                 gamma_inv: torch.Tensor) -> torch.Tensor:
-        """
-        Compute 3D Ricci scalar using finite differences.
-        This is a simplified implementation for demonstration.
-        """
-        batch_size = coords.shape[0]
-        device = coords.device
-        
-        # For now, return zero (full implementation would compute Christoffel symbols)
-        # In practice, you'd use automatic differentiation of gamma
-        R_3d = torch.zeros(batch_size, device=device)
-        
-        return R_3d
-    
-    def _safe_inverse(self, matrix: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-        """Stable matrix inversion."""
-        U, S, Vh = torch.linalg.svd(matrix)
-        S_inv = torch.where(S > epsilon, 1.0 / S, 1.0 / epsilon)
-        return torch.matmul(Vh.transpose(-2, -1), 
-                           torch.matmul(torch.diag_embed(S_inv), U.transpose(-2, -1)))
-
-
-# ============================================================================
-# BREAKTHROUGH DETECTION SYSTEM
-# ============================================================================
-
-class BreakthroughDetector:
-    """
-    Advanced system for detecting novel and potentially breakthrough solutions.
-    Monitors for unusual curvature patterns, energy violations, and novel symmetries.
-    """
-    
-    def __init__(self, config: BreakthroughConfig):
-        self.config = config
-        self.history: Dict[str, List[float]] = {
-            'constraint_violation': [],
-            'curvature_max': [],
-            'energy_density': [],
-            'metric_determinant': []
-        }
-        self.breakthroughs: List[Dict[str, Any]] = []
-    
-    def check_for_breakthrough(self, coords: torch.Tensor, 
-                              adm_vars: Dict[str, torch.Tensor],
-                              constraints: Dict[str, torch.Tensor],
-                              epoch: int) -> Optional[Dict[str, Any]]:
-        """
-        Analyze current solution for breakthrough characteristics:
-        1. Novel curvature patterns (high curvature in unexpected regions)
-        2. Stable constraint satisfaction with unusual metric properties
-        3. New symmetries or conservation laws
-        4. Energy condition violations that remain stable
-        """
-        if not self.config.enabled or epoch % self.config.check_every != 0:
-            return None
-        
-        # Compute metrics
-        metrics = self._compute_metrics(coords, adm_vars, constraints)
-        
-        # Update history
-        for key, value in metrics.items():
-            self.history[key].append(value)
-        
-        # Keep only recent history
-        if len(self.history['constraint_violation']) > self.config.history_window:
-            for key in self.history:
-                self.history[key] = self.history[key][-self.config.history_window:]
-        
-        # Check for breakthrough conditions
-        if len(self.history['constraint_violation']) >= 10:
-            is_breakthrough, reasons = self._analyze_breakthrough_conditions(metrics)
-            
-            if is_breakthrough:
-                breakthrough = {
-                    'epoch': epoch,
-                    'metrics': metrics,
-                    'reasons': reasons,
-                    'coords_sample': coords[:10].detach().cpu().numpy(),
-                    'adm_vars_sample': {k: v[:10].detach().cpu().numpy() 
-                                       for k, v in adm_vars.items()}
-                }
-                self.breakthroughs.append(breakthrough)
-                return breakthrough
-        
-        return None
-    
-    def _compute_metrics(self, coords: torch.Tensor, 
-                        adm_vars: Dict[str, torch.Tensor],
-                        constraints: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Compute various metrics for analysis."""
-        with torch.no_grad():
-            # Constraint violation
-            H_violation = torch.abs(constraints.get('hamiltonian', torch.tensor(0.0))).mean().item()
-            M_violation = torch.abs(constraints.get('momentum', torch.tensor(0.0))).mean().item()
-            
-            # Curvature measures
-            K = adm_vars['K']
-            gamma_inv = self._safe_inverse(adm_vars['gamma'])
-            K_trace = torch.einsum('bij,bij->b', gamma_inv, K)
-            curvature_max = torch.abs(K_trace).max().item()
-            
-            # Metric determinant
-            det_gamma = torch.det(adm_vars['gamma'])
-            metric_det = det_gamma.mean().item()
-            
-            # Energy density (if available)
-            energy_density = 0.0  # Placeholder
-            
-            return {
-                'constraint_violation': H_violation + M_violation,
-                'curvature_max': curvature_max,
-                'energy_density': energy_density,
-                'metric_determinant': metric_det
-            }
-    
-    def _analyze_breakthrough_conditions(self, metrics: Dict[str, float]) -> Tuple[bool, List[str]]:
-        """Analyze if current solution represents a breakthrough."""
-        reasons = []
-        
-        # 1. Check for novel curvature patterns
-        recent_curvature = self.history['curvature_max'][-10:]
-        curvature_mean = np.mean(recent_curvature)
-        curvature_std = np.std(recent_curvature)
-        
-        if metrics['curvature_max'] > curvature_mean + self.config.novelty_threshold * curvature_std:
-            reasons.append("Novel high-curvature region detected")
-        
-        # 2. Check for stability
-        recent_violations = self.history['constraint_violation'][-10:]
-        violation_stability = np.std(recent_violations)
-        
-        if violation_stability < self.config.stability_threshold:
-            reasons.append("Exceptional constraint stability achieved")
-        
-        # 3. Check for unusual metric properties
-        recent_det = self.history['metric_determinant'][-10:]
-        if abs(metrics['metric_determinant'] - 1.0) > 0.5:
-            reasons.append("Non-trivial metric determinant pattern")
-        
-        # 4. Combined criteria
-        if (len(reasons) >= 2 and 
-            metrics['constraint_violation'] < self.config.stability_threshold):
-            return True, reasons
-        
-        return False, []
-    
-    def _safe_inverse(self, matrix: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-        U, S, Vh = torch.linalg.svd(matrix)
-        S_inv = torch.where(S > epsilon, 1.0 / S, 1.0 / epsilon)
-        return torch.matmul(Vh.transpose(-2, -1), 
-                           torch.matmul(torch.diag_embed(S_inv), U.transpose(-2, -1)))
-
-
-# ============================================================================
-# TRAINING SYSTEM WITH CURRICULUM LEARNING
-# ============================================================================
-
-class ADMSolver:
-    """
-    Main solver for 3+1 ADM decomposition with PINNs.
-    Features curriculum learning, adaptive sampling, and breakthrough detection.
-    """
-    
-    def __init__(self, 
-                 network_config: NetworkConfig,
-                 adm_config: ADMConfig,
-                 training_config: TrainingConfig,
-                 breakthrough_config: BreakthroughConfig,
-                 matter: Optional[MatterField] = None):
-        
-        self.network_config = network_config
-        self.adm_config = adm_config
-        self.training_config = training_config
-        self.breakthrough_config = breakthrough_config
-        
-        # Device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
-        
-        # Networks
-        self.adm_network = ADMNetwork(network_config).to(self.device)
-        self.matter = matter
-        if self.matter is not None:
-            self.matter = self.matter.to(self.device)
-        
-        # Physics
-        self.physics = ADMPhysics(adm_config)
-        
-        # Breakthrough detector
-        self.breakthrough_detector = BreakthroughDetector(breakthrough_config)
-        
-        # Training state
-        self.history: Dict[str, List[float]] = {
-            'total_loss': [],
-            'hamiltonian_loss': [],
-            'momentum_loss': [],
-            'gauge_loss': []
-        }
-        self.best_loss = float('inf')
-        self.epochs_without_improvement = 0
-        
-        # Curriculum learning stages
-        self.current_stage = 0
-        self.spatial_extent_schedule = np.linspace(5.0, 30.0, training_config.curriculum_stages)
-    
-    def sample_coordinates(self, batch_size: int, spatial_extent: float) -> torch.Tensor:
-        """Sample training coordinates with adaptive strategy."""
-        coords = torch.zeros(batch_size, 4, device=self.device)
-        
-        # Time (for now, consider static spacetime)
-        coords[:, 0] = 0.0
-        
-        # Spatial coordinates (with focus on regions of interest)
-        if self.training_config.adaptive_sampling and len(self.history['total_loss']) > 10:
-            # 50% uniform, 50% focused on high-curvature regions
-            n_uniform = batch_size // 2
-            n_focused = batch_size - n_uniform
-            
-            # Uniform sampling
-            coords[:n_uniform, 1:] = (torch.rand(n_uniform, 3, device=self.device) - 0.5) * 2 * spatial_extent
-            
-            # Focused sampling (example: near origin for black holes)
-            r = torch.rand(n_focused, device=self.device) ** 0.5 * spatial_extent * 0.3
-            theta = torch.rand(n_focused, device=self.device) * np.pi
-            phi = torch.rand(n_focused, device=self.device) * 2 * np.pi
-            
-            coords[n_uniform:, 1] = r * torch.sin(theta) * torch.cos(phi)
-            coords[n_uniform:, 2] = r * torch.sin(theta) * torch.sin(phi)
-            coords[n_uniform:, 3] = r * torch.cos(theta)
-        else:
-            # Pure uniform sampling
-            coords[:, 1:] = (torch.rand(batch_size, 3, device=self.device) - 0.5) * 2 * spatial_extent
-        
-        return coords
-    
-    def compute_loss(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute total physics-informed loss."""
-        # Get ADM variables
-        adm_vars = self.adm_network(coords)
-        
-        # Compute constraints
-        H = self.physics.hamiltonian_constraint(coords, adm_vars, self.matter)
-        M = self.physics.momentum_constraint(coords, adm_vars, self.matter)
-        G = self.physics.gauge_condition(coords, adm_vars)
-        
-        # Individual losses
-        hamiltonian_loss = torch.mean(H ** 2)
-        momentum_loss = torch.mean(torch.sum(M ** 2, dim=-1))
-        gauge_loss = torch.mean(G ** 2)
-        
-        # Total loss
-        total_loss = (self.adm_config.hamiltonian_weight * hamiltonian_loss +
-                     self.adm_config.momentum_weight * momentum_loss +
-                     self.adm_config.gauge_weight * gauge_loss)
-        
-        return {
-            'total_loss': total_loss,
-            'hamiltonian_loss': hamiltonian_loss,
-            'momentum_loss': momentum_loss,
-            'gauge_loss': gauge_loss,
-            'constraints': {'hamiltonian': H, 'momentum': M}
-        }
-    
-    def train(self) -> Dict[str, List[float]]:
-        """Main training loop with curriculum learning."""
-        # Optimizer
-        optimizer = torch.optim.AdamW(
-            list(self.adm_network.parameters()) + 
-            (list(self.matter.parameters()) if self.matter else []),
-            lr=self.training_config.lr_initial
+        self.net = nn.Sequential(
+            SineLayer(4, config.hidden_dim, config.omega_0, is_first=True),
+            SineLayer(config.hidden_dim, config.hidden_dim, config.omega_0),
+            SineLayer(config.hidden_dim, config.hidden_dim, config.omega_0),
+            SineLayer(config.hidden_dim, config.hidden_dim, config.omega_0),
+            SineLayer(config.hidden_dim, config.hidden_dim, config.omega_0),
+            SineLayer(config.hidden_dim, config.hidden_dim, config.omega_0),
+            nn.Linear(config.hidden_dim, 10) 
         )
         
-        # Scheduler
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer, 
-            gamma=self.training_config.lr_decay
+    def forward(self, coords):
+        output = self.net(coords)
+        lapse = F.softplus(output[:, 0]) + 0.1 
+        shift = output[:, 1:4]
+        L_raw = output[:, 4:] 
+        batch_size = coords.shape[0]
+        L = torch.zeros(batch_size, 3, 3, device=device)
+        L[:, 0, 0] = F.softplus(L_raw[:, 0]) + 0.1
+        L[:, 1, 1] = F.softplus(L_raw[:, 1]) + 0.1
+        L[:, 2, 2] = F.softplus(L_raw[:, 2]) + 0.1
+        L[:, 1, 0] = L_raw[:, 3]
+        L[:, 2, 0] = L_raw[:, 4]
+        L[:, 2, 1] = L_raw[:, 5]
+        spatial_metric = torch.bmm(L, L.transpose(1, 2))
+        return lapse, shift, spatial_metric
+
+# --- 3. Physics & Loss Functions ---
+
+def build_4d_metric(lapse, shift, spatial_metric):
+    B = lapse.shape[0]
+    shift_vec = shift.unsqueeze(2) 
+    shift_cov = torch.bmm(spatial_metric, shift_vec).squeeze(2) 
+    shift_sq = torch.sum(shift * shift_cov, dim=1)
+    g00 = -(lapse**2) + shift_sq
+    
+    metric_4d = torch.zeros(B, 4, 4, device=lapse.device)
+    metric_4d[:, 0, 0] = g00
+    metric_4d[:, 0, 1:] = shift_cov
+    metric_4d[:, 1:, 0] = shift_cov
+    metric_4d[:, 1:, 1:] = spatial_metric
+    return metric_4d
+
+def exotic_fluid_T(coords_4d, rho0=-0.1):
+    B = coords_4d.shape[0]
+    T = torch.zeros(B, 4, 4, device=coords_4d.device)
+    T[:, 0, 0] = rho0
+    return T
+
+def einstein_residual_loss(metric_4d, coords_4d, T_mu_nu_fn=None):
+    G = GRGeometry.einstein_tensor(metric_4d, coords_4d)
+    if T_mu_nu_fn is None:
+        T = torch.zeros_like(G)
+    else:
+        T = T_mu_nu_fn(coords_4d)
+    residual = G - 8 * np.pi * T
+    loss = torch.mean(residual**2)
+    return loss, residual
+
+def time_dependence_penalty(metric_4d, coords_4d):
+    B, D, _ = metric_4d.shape
+    g_flat = metric_4d.view(B, -1)
+    penalty = 0.0
+    for i in range(D * D):
+        grads = diff(g_flat[:, i].unsqueeze(1), coords_4d)
+        dt_g = grads[:, 0]
+        penalty += torch.mean(dt_g**2)
+    return penalty
+
+def momentum_constraint(theta, coords_spatial):
+    return torch.mean(theta**2)
+
+# --- 4. Feature Extraction & Surrogate Model ---
+
+def extract_features(coords, lapse, rho, G_res_norm):
+    """Computes embedding of the solution."""
+    def radial_moments(v):
+        return [float(v.min()), float(v.max()), float(v.mean()), float(np.mean(np.abs(v)))]
+
+    lapse_m = radial_moments(lapse)
+    rho_m   = radial_moments(rho)
+
+    feats = np.array([
+        *lapse_m,          # 4 numbers
+        *rho_m,            # 4 numbers
+        G_res_norm,        # 1 number
+    ], dtype=np.float32)
+    return feats
+
+class SurrogateModel(nn.Module):
+    """
+    Predicts the 'Interest Score' of a hyperparameter set.
+    Input: [rho_0, lambda_topology, radius, omega] (normalized)
+    Output: Estimated Interest Score
+    """
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
         )
         
-        print("="*80)
-        print("STARTING 3+1 ADM PINN TRAINING")
-        print("="*80)
-        print(f"Network: {self.network_config.hidden_dim}x{self.network_config.num_layers}")
-        print(f"Device: {self.device}")
-        print(f"Curriculum stages: {self.training_config.curriculum_stages}")
-        print("="*80)
+    def forward(self, x):
+        return self.net(x)
+
+class ActiveSearchPolicy:
+    def __init__(self, bounds):
+        self.bounds = bounds # Dict of ranges {param: (min, max)}
+        self.model = SurrogateModel().to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
+        self.history_X = [] # Hyperparams
+        self.history_y = [] # Scores
+        self.epsilon = 0.3  # Exploration rate
         
-        start_time = time.time()
+    def normalize(self, params_dict):
+        # Convert dict to normalized tensor [0, 1]
+        vec = []
+        keys = ['exotic_rho_0', 'lambda_topology', 'domain_radius', 'omega_0']
+        for k in keys:
+            val = params_dict.get(k, 0)
+            low, high = self.bounds[k]
+            # Clip and normalize
+            val = max(min(val, high), low)
+            norm_val = (val - low) / (high - low + 1e-6)
+            vec.append(norm_val)
+        return torch.tensor(vec, dtype=torch.float32).to(device)
+
+    def denormalize(self, vec):
+        # Convert tensor back to dict
+        params = {}
+        keys = ['exotic_rho_0', 'lambda_topology', 'domain_radius', 'omega_0']
+        for i, k in enumerate(keys):
+            low, high = self.bounds[k]
+            val = vec[i].item() * (high - low) + low
+            params[k] = float(val)
+        return params
+
+    def train(self):
+        if len(self.history_X) < 5: return
         
-        for epoch in range(self.training_config.epochs):
-            # Update curriculum stage
-            stage = min(epoch // (self.training_config.epochs // self.training_config.curriculum_stages),
-                       self.training_config.curriculum_stages - 1)
-            spatial_extent = self.spatial_extent_schedule[stage]
+        X = torch.stack(self.history_X)
+        y = torch.tensor(self.history_y, dtype=torch.float32).unsqueeze(1).to(device)
+        
+        # Simple training loop
+        for _ in range(50):
+            self.optimizer.zero_grad()
+            pred = self.model(X)
+            loss = F.mse_loss(pred, y)
+            loss.backward()
+            self.optimizer.step()
+
+    def propose_next_experiments(self, n_candidates=500, n_select=1):
+        # 1. Random Sampling of Candidates in normalized space
+        candidates = torch.rand(n_candidates, 4).to(device)
+        
+        # 2. Predict Scores using Surrogate
+        self.model.eval()
+        with torch.no_grad():
+            scores = self.model(candidates).flatten()
+        self.model.train()
             
-            if stage != self.current_stage:
-                self.current_stage = stage
-                print(f"\n{'='*80}")
-                print(f"CURRICULUM STAGE {stage+1}/{self.training_config.curriculum_stages}")
-                print(f"Spatial extent: {spatial_extent:.2f}")
-                print(f"{'='*80}\n")
+        # 3. Acquisition Strategy: Epsilon-Greedy
+        best_indices = torch.argsort(scores, descending=True)
+        
+        proposals = []
+        for i in range(n_select):
+            if np.random.rand() < self.epsilon:
+                # Explore: Pick random candidate
+                idx = np.random.randint(0, n_candidates)
+                print(f"   [Policy] Exploring random candidate...")
+            else:
+                # Exploit: Pick best predicted
+                idx = best_indices[i]
+                print(f"   [Policy] Exploiting best candidate (Pred Score: {scores[idx]:.3f})...")
+                
+            params = self.denormalize(candidates[idx])
+            proposals.append(params)
             
-            # Sample coordinates
-            coords = self.sample_coordinates(self.training_config.batch_size, spatial_extent)
-            
-            # Forward pass
+        return proposals
+
+    def update_history(self, params, score):
+        self.history_X.append(self.normalize(params))
+        self.history_y.append(score)
+
+# --- 5. Simulation Controller & Campaign Runner ---
+
+class GravitySimulator:
+    def __init__(self, config):
+        self.config = config
+        self.device = device
+        
+    def build_model(self):
+        return MetricEstimator(self.config).to(self.device)
+
+    def train_simulation(self, target_topology):
+        model = self.build_model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
+        
+        n_samples = self.config.batch_size
+        loss_history = []
+
+        for epoch in range(1, self.config.epochs + 1):
             optimizer.zero_grad()
-            loss_dict = self.compute_loss(coords)
-            total_loss = loss_dict['total_loss']
-            
-            # Backward pass
-            total_loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                list(self.adm_network.parameters()) + 
-                (list(self.matter.parameters()) if self.matter else []),
-                self.training_config.grad_clip
-            )
-            
-            optimizer.step()
-            
-            # Record history
-            for key in ['total_loss', 'hamiltonian_loss', 'momentum_loss', 'gauge_loss']:
-                self.history[key].append(loss_dict[key].item())
-            
-            # Update best loss
-            current_loss = loss_dict['total_loss'].item()
-            if current_loss < self.best_loss:
-                self.best_loss = current_loss
-                self.epochs_without_improvement = 0
+
+            # Sampling
+            spatial = (torch.rand(n_samples, 3, device=self.device) - 0.5) * 2 * self.config.domain_radius
+            if target_topology == "warp_bubble":
+                spatial[:, 0] *= 0.8; spatial[:, 1] *= 0.3; spatial[:, 2] *= 0.3
             else:
-                self.epochs_without_improvement += 1
+                mask = torch.rand(n_samples, device=self.device) < 0.7
+                spatial[mask] *= 0.25
+
+            t = torch.zeros(n_samples, 1, device=self.device)
+            coords_4d = torch.cat([t, spatial], dim=1)
+            coords_4d.requires_grad_(True)
+            coords_spatial = coords_4d[:, 1:4]
+
+            # Forward
+            lapse, shift, spatial_metric = model(coords_4d)
+            metric_4d = build_4d_metric(lapse, shift, spatial_metric)
+
+            # Matter Source (Uses config rho0)
+            if target_topology == "wormhole":
+                T_fn = lambda c: exotic_fluid_T(c, rho0=self.config.exotic_rho_0)
+            elif target_topology == "warp_bubble":
+                T_fn = lambda c: exotic_fluid_T(c, rho0=self.config.exotic_rho_0)
+            else:
+                T_fn = None
+
+            # Physics Loss
+            loss_physics, _ = einstein_residual_loss(metric_4d, coords_4d, T_mu_nu_fn=T_fn)
             
-            # Learning rate decay
-            if (epoch + 1) % self.training_config.decay_every == 0:
-                scheduler.step()
+            # Constraints
+            g00 = metric_4d[:, 0, 0]
+            loss_signature = torch.mean(F.relu(g00 + 1e-3)**2)
+            det_g = torch.det(metric_4d)
+            loss_det = torch.mean(F.relu(1e-4 - torch.abs(det_g))**2)
+            loss_static = time_dependence_penalty(metric_4d, coords_4d)
+            theta = DifferentialGeometry.expansion_scalar(shift, coords_spatial)
+            loss_momentum = momentum_constraint(theta, coords_spatial)
+
+            # Topology Shaping (Uses config lambda_topology)
+            R_spatial = DifferentialGeometry.ricci_scalar(spatial_metric, coords_spatial)
+            loss_topology = 0.0
             
-            # Breakthrough detection
-            adm_vars = self.adm_network(coords)
-            breakthrough = self.breakthrough_detector.check_for_breakthrough(
-                coords, adm_vars, loss_dict['constraints'], epoch
+            # Weighted by lambda_topology from hyperparams
+            if target_topology == "anomaly_hunter":
+                metric_identity_dist = torch.mean((spatial_metric - torch.eye(3, device=self.device))**2)
+                loss_complexity = torch.mean(R_spatial**2) * 0.1
+                loss_topology = loss_complexity - metric_identity_dist * self.config.lambda_complexity
+            elif target_topology == "wormhole":
+                loss_topology += torch.mean(F.relu(0.1 - lapse)**2) * 50.0
+                r = torch.sqrt(torch.sum(coords_spatial**2, dim=1))
+                if (r < 1.0).sum() > 0:
+                    loss_topology += torch.mean((torch.abs(R_spatial[r < 1.0]) - 20.0)**2) * 0.1
+            elif target_topology == "warp_bubble":
+                r_s = torch.sqrt(torch.sum(coords_spatial**2, dim=1))
+                target_shift_x = torch.exp(-r_s**2)
+                loss_topology += F.mse_loss(shift[:, 0], target_shift_x) * 10.0
+                loss_topology += torch.mean(shift[:, 1]**2 + shift[:, 2]**2)
+                if (coords_spatial[:, 0] > 0.1).sum() > 0:
+                    loss_topology += torch.mean(F.relu(theta[coords_spatial[:, 0] > 0.1] + 0.1)**2) * 5.0
+                if (coords_spatial[:, 0] < -0.1).sum() > 0:
+                    loss_topology += torch.mean(F.relu(0.1 - theta[coords_spatial[:, 0] < -0.1])**2) * 5.0
+
+            # Total Loss
+            total_loss = (
+                self.config.lambda_hamiltonian * loss_physics +
+                self.config.lambda_boundary    * loss_boundary +
+                self.config.lambda_topology    * loss_topology + # Controlled by policy
+                self.config.lambda_momentum    * loss_momentum +
+                self.config.lambda_static      * loss_static +
+                self.config.lambda_signature   * loss_signature +
+                self.config.lambda_determinant * loss_det
             )
             
-            if breakthrough:
-                print(f"\n{'*'*80}")
-                print(f"🎉 BREAKTHROUGH DETECTED AT EPOCH {epoch+1}!")
-                print(f"{'*'*80}")
-                for reason in breakthrough['reasons']:
-                    print(f"  • {reason}")
-                print(f"Metrics: {breakthrough['metrics']}")
-                print(f"{'*'*80}\n")
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            loss_history.append(total_loss.item())
             
-            # Progress reporting
-            if (epoch + 1) % 50 == 0:
-                elapsed = time.time() - start_time
-                print(f"Epoch {epoch+1}/{self.training_config.epochs} | "
-                      f"Loss: {current_loss:.6f} | "
-                      f"H: {loss_dict['hamiltonian_loss'].item():.6f} | "
-                      f"M: {loss_dict['momentum_loss'].item():.6f} | "
-                      f"G: {loss_dict['gauge_loss'].item():.6f} | "
-                      f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                      f"Time: {elapsed:.1f}s")
+            if self.config.verbose and epoch % 200 == 0:
+                print(f"   Ep {epoch} | Loss: {total_loss.item():.4f}")
+
+        # Final Evaluation
+        lapse, shift, spatial_metric = model(coords_4d)
+        metric_4d = build_4d_metric(lapse, shift, spatial_metric)
+        G_final = GRGeometry.einstein_tensor(metric_4d, coords_4d)
+        rho_implied = G_final[:, 0, 0] / (8 * np.pi)
+
+        return (
+            model, 
+            coords_spatial.detach().cpu().numpy(), 
+            lapse.detach().cpu().numpy(), 
+            shift.detach().cpu().numpy(), 
+            rho_implied.detach().cpu().numpy(),
+            loss_history
+        )
+
+class ExperimentRunner:
+    def __init__(self):
+        self.feature_db = [] # List of existing feature vectors
+
+    @staticmethod
+    def generate_iso_grid(radius, resolution=10):
+        axis = np.linspace(-radius, radius, resolution)
+        X, Y, Z = np.meshgrid(axis, axis, axis)
+        coords_np = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=1)
+        
+        t = torch.zeros(coords_np.shape[0], 1)
+        spatial = torch.tensor(coords_np, dtype=torch.float32)
+        coords_4d = torch.cat([t, spatial], dim=1).to(device)
+        coords_4d.requires_grad_(True)
+        return coords_4d, coords_np
+        
+    def calculate_novelty(self, feats):
+        if not self.feature_db:
+            return 1.0 
+        existing = np.stack(self.feature_db, axis=0)
+        dists = np.linalg.norm(existing - feats[None, :], axis=1)
+        return float(dists.min())
+
+    def classify_topology(self, lapse, shift, rho):
+        min_lapse = float(lapse.min())
+        max_shift = float(np.linalg.norm(shift, axis=1).max())
+        min_rho = float(rho.min())
+        tags = []
+        if min_lapse < 0.15: tags.append("Horizon-Candidate")
+        elif min_lapse > 0.9: tags.append("Minkowski-Like")
+        if min_rho < -0.01: tags.append("Exotic-Matter")
+        if max_shift > 0.5:
+            tags.append("High-Shift")
+            if "Exotic-Matter" in tags: tags.append("Warp-Drive-Candidate")
+        if not tags: tags.append("Unknown-Topology")
+        return ", ".join(tags)
+
+    def run_active_discovery(self, base_config, mode="warp_bubble", n_rounds=6, batch_size=1):
+        """
+        Runs an Active Learning loop to find interesting physics.
+        """
+        results = []
+        self.feature_db = []
+        
+        # Define Search Space
+        policy = ActiveSearchPolicy(bounds={
+            'exotic_rho_0': (-0.5, -0.01),   # Try different fuel densities
+            'lambda_topology': (1.0, 50.0),  # Try different forcing strengths
+            'domain_radius': (2.0, 6.0),     # Try different bubble sizes
+            'omega_0': (10.0, 60.0)          # Try different frequencies
+        })
+        
+        print(f"\n=== STARTING ACTIVE DISCOVERY: {mode.upper()} ({n_rounds} rounds) ===")
+        
+        eval_coords_4d, eval_coords_np = self.generate_iso_grid(base_config.domain_radius, resolution=12)
+        
+        for r in range(n_rounds):
+            print(f"\n--- ROUND {r+1}/{n_rounds} ---")
             
-            # Early stopping
-            if self.epochs_without_improvement >= self.training_config.early_stopping_patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                break
-        
-        total_time = time.time() - start_time
-        print(f"\n{'='*80}")
-        print(f"TRAINING COMPLETE")
-        print(f"Total time: {total_time:.2f}s")
-        print(f"Final loss: {self.best_loss:.6f}")
-        print(f"Breakthroughs detected: {len(self.breakthrough_detector.breakthroughs)}")
-        print(f"{'='*80}\n")
-        
-        return self.history
-    
-    def predict(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Predict ADM variables at given coordinates."""
-        with torch.no_grad():
-            coords = coords.to(self.device)
-            adm_vars = self.adm_network(coords)
+            # 1. Propose Experiments
+            if r == 0:
+                # Initial random seeds
+                print("   [Init] Running random seeds...")
+                specs = [{'hyperparams': {}} for _ in range(batch_size)] 
+                # Randomize slightly for init
+                for s in specs:
+                    s['hyperparams'] = {
+                        'exotic_rho_0': np.random.uniform(-0.3, -0.05),
+                        'lambda_topology': np.random.uniform(5.0, 20.0)
+                    }
+            else:
+                # Active Selection
+                print("   [Policy] Proposing new parameters...")
+                proposals = policy.propose_next_experiments(n_candidates=500, n_select=batch_size)
+                specs = [{'hyperparams': p} for p in proposals]
+
+            # 2. Run Simulations
+            for i, spec in enumerate(specs):
+                # Update Config
+                run_config = copy.deepcopy(base_config)
+                run_config.update(**spec['hyperparams'])
+                
+                # Run
+                seed = int(time.time()) + i
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                
+                print(f"   Running Solve (rho0={run_config.exotic_rho_0:.3f}, lambda={run_config.lambda_topology:.1f})...")
+                sim = GravitySimulator(run_config)
+                model, _, _, _, _, history = sim.train_simulation(mode)
+                
+                # Evaluate
+                with torch.enable_grad(): 
+                    lapse_eval, shift_eval, spat_eval = model(eval_coords_4d)
+                    metric_4d_eval = build_4d_metric(lapse_eval, shift_eval, spat_eval)
+                    if mode in ["wormhole", "warp_bubble"]:
+                        T_fn = lambda c: exotic_fluid_T(c, rho0=run_config.exotic_rho_0)
+                    else: T_fn = None
+                    _, residual = einstein_residual_loss(metric_4d_eval, eval_coords_4d, T_fn)
+                    G_final = GRGeometry.einstein_tensor(metric_4d_eval, eval_coords_4d)
+                    rho_implied = G_final[:, 0, 0] / (8 * np.pi)
+                
+                G_res_norm = torch.mean(residual**2).item()
+                
+                # Features & Novelty
+                lapse_np = lapse_eval.detach().cpu().numpy().flatten()
+                shift_np = shift_eval.detach().cpu().numpy()
+                rho_np = rho_implied.detach().cpu().numpy().flatten()
+                
+                feats = extract_features(eval_coords_np, lapse_np, rho_np, G_res_norm)
+                novelty_score = self.calculate_novelty(feats)
+                self.feature_db.append(feats)
+                
+                # Calculate Interest Score for Policy Training
+                # High Interest = Valid Physics (Low Res) AND Novel
+                # Score = Novelty / (1 + Residual_Penalty)
+                interest_score = novelty_score / (1.0 + np.log1p(G_res_norm * 10.0))
+                
+                # Update Policy
+                policy.update_history(spec['hyperparams'], interest_score)
+                
+                classification = self.classify_topology(lapse_np, shift_np, rho_np)
+                
+                # Log Result
+                entry = {
+                    "id": f"active_{r}_{i}",
+                    "mode": mode,
+                    "hyperparams": spec['hyperparams'],
+                    "G_res_norm": G_res_norm,
+                    "novelty": novelty_score,
+                    "interest": interest_score,
+                    "classification": classification,
+                    "coords": eval_coords_np,
+                    "lapse_field": lapse_np,
+                    "rho_field": rho_np,
+                }
+                results.append(entry)
+                print(f"   -> Result: Res={G_res_norm:.4f}, Nov={novelty_score:.3f}, Int={interest_score:.3f} | {classification}")
+
+            # 3. Train Policy
+            print("   [Policy] Updating surrogate model...")
+            policy.train()
             
-            # Also compute 4D metric
-            g_4d = self.adm_network.get_4d_metric(adm_vars)
-            adm_vars['metric_4d'] = g_4d
-            
-            # Compute constraints
-            H = self.physics.hamiltonian_constraint(coords, adm_vars, self.matter)
-            M = self.physics.momentum_constraint(coords, adm_vars, self.matter)
-            
-            adm_vars['hamiltonian_constraint'] = H
-            adm_vars['momentum_constraint'] = M
-            
-        return {k: v.cpu() for k, v in adm_vars.items()}
+        return results
 
+def rank_solutions(dataset):
+    df = pd.DataFrame(dataset)
+    df = df.sort_values('interest', ascending=False)
+    print("\n=== TOP DISCOVERED SOLUTIONS ===")
+    cols = ['id', 'classification', 'G_res_norm', 'novelty', 'interest']
+    print(df[cols].to_string(index=False))
+    return df
 
-# ============================================================================
-# ADVANCED VISUALIZATION SYSTEM
-# ============================================================================
+def visualize_entry(entry):
+    coords = entry['coords']
+    lapse = entry['lapse_field']
+    rho = entry['rho_field']
+    
+    fig = plt.figure(figsize=(10, 5))
+    ax1 = fig.add_subplot(121, projection='3d')
+    p1 = ax1.scatter(coords[:,0], coords[:,1], coords[:,2], c=lapse, cmap='magma', s=10)
+    ax1.set_title(f"Lapse ({entry['mode']})")
+    fig.colorbar(p1, ax=ax1)
+    
+    ax2 = fig.add_subplot(122, projection='3d')
+    p2 = ax2.scatter(coords[:,0], coords[:,1], coords[:,2], c=rho, cmap='viridis', s=10)
+    ax2.set_title("Implied Rho")
+    fig.colorbar(p2, ax=ax2)
+    
+    params_str = ", ".join([f"{k}:{v:.2f}" for k,v in entry['hyperparams'].items()])
+    plt.suptitle(f"Run: {entry['id']} | {params_str}")
+    plt.tight_layout()
+    plt.show()
 
-class ADMVisualizer:
-    """Advanced visualization system for ADM decomposition results."""
-    
-    def __init__(self, config: VisualizationConfig):
-        self.config = config
-    
-    def plot_training_history(self, history: Dict[str, List[float]], 
-                             filename: str = "training_history.png"):
-        """Plot training history with multiple loss components."""
-        fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
-        
-        epochs = np.arange(1, len(history['total_loss']) + 1)
-        
-        # Total loss
-        ax1 = fig.add_subplot(gs[0, :])
-        ax1.semilogy(epochs, history['total_loss'], 'b-', linewidth=2, label='Total Loss')
-        ax1.set_xlabel('Epoch', fontsize=12)
-        ax1.set_ylabel('Loss (log scale)', fontsize=12)
-        ax1.set_title('Total Training Loss', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend(fontsize=11)
-        
-        # Individual components
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.semilogy(epochs, history['hamiltonian_loss'], 'r-', linewidth=2, label='Hamiltonian')
-        ax2.set_xlabel('Epoch', fontsize=12)
-        ax2.set_ylabel('Loss (log scale)', fontsize=12)
-        ax2.set_title('Hamiltonian Constraint', fontsize=14, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend(fontsize=11)
-        
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.semilogy(epochs, history['momentum_loss'], 'g-', linewidth=2, label='Momentum')
-        ax3.set_xlabel('Epoch', fontsize=12)
-        ax3.set_ylabel('Loss (log scale)', fontsize=12)
-        ax3.set_title('Momentum Constraint', fontsize=14, fontweight='bold')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend(fontsize=11)
-        
-        plt.suptitle('3+1 ADM PINN Training Progress', fontsize=16, fontweight='bold', y=0.98)
-        
-        if self.config.save_plots:
-            plt.savefig(filename, dpi=self.config.dpi, bbox_inches='tight')
-            print(f"Saved training history to {filename}")
-        
-        plt.close()
-    
-    def plot_adm_fields(self, solver: ADMSolver, filename: str = "adm_fields.png"):
-        """Visualize ADM fields in a 2D slice."""
-        # Create coordinate grid (z=0 slice)
-        x = np.linspace(-self.config.spatial_extent, self.config.spatial_extent, self.config.resolution)
-        y = np.linspace(-self.config.spatial_extent, self.config.spatial_extent, self.config.resolution)
-        X, Y = np.meshgrid(x, y)
-        
-        # Convert to torch tensor
-        coords = torch.zeros(self.config.resolution ** 2, 4)
-        coords[:, 0] = 0.0  # t = 0
-        coords[:, 1] = torch.from_numpy(X.flatten())
-        coords[:, 2] = torch.from_numpy(Y.flatten())
-        coords[:, 3] = 0.0  # z = 0
-        
-        # Predict
-        results = solver.predict(coords)
-        
-        # Extract fields
-        lapse = results['lapse'].numpy().reshape(self.config.resolution, self.config.resolution)
-        H = results['hamiltonian_constraint'].numpy().reshape(self.config.resolution, self.config.resolution)
-        
-        # Get trace of K
-        gamma_np = results['gamma'].numpy()
-        K_np = results['K'].numpy()
-        K_trace = np.zeros(self.config.resolution ** 2)
-        for i in range(self.config.resolution ** 2):
-            gamma_inv = np.linalg.inv(gamma_np[i] + 1e-8 * np.eye(3))
-            K_trace[i] = np.trace(gamma_inv @ K_np[i])
-        K_trace = K_trace.reshape(self.config.resolution, self.config.resolution)
-        
-        # Create plot
-        fig = plt.figure(figsize=self.config.figsize)
-        gs = GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.4)
-        
-        # Lapse function
-        ax1 = fig.add_subplot(gs[0, 0])
-        im1 = ax1.contourf(X, Y, lapse, levels=20, cmap='viridis')
-        ax1.set_title('Lapse Function α', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('x', fontsize=12)
-        ax1.set_ylabel('y', fontsize=12)
-        plt.colorbar(im1, ax=ax1)
-        
-        # Trace of K
-        ax2 = fig.add_subplot(gs[0, 1])
-        im2 = ax2.contourf(X, Y, K_trace, levels=20, cmap='RdBu_r', vmin=-np.abs(K_trace).max(), vmax=np.abs(K_trace).max())
-        ax2.set_title('Extrinsic Curvature Trace K', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('x', fontsize=12)
-        ax2.set_ylabel('y', fontsize=12)
-        plt.colorbar(im2, ax=ax2)
-        
-        # Hamiltonian constraint violation
-        ax3 = fig.add_subplot(gs[0, 2])
-        im3 = ax3.contourf(X, Y, np.abs(H), levels=20, cmap='hot', norm=plt.matplotlib.colors.LogNorm(vmin=1e-6, vmax=np.abs(H).max()+1e-8))
-        ax3.set_title('|Hamiltonian Constraint|', fontsize=14, fontweight='bold')
-        ax3.set_xlabel('x', fontsize=12)
-        ax3.set_ylabel('y', fontsize=12)
-        plt.colorbar(im3, ax=ax3, label='log scale')
-        
-        # Spatial metric components
-        gamma_11 = gamma_np[:, 0, 0].reshape(self.config.resolution, self.config.resolution)
-        gamma_22 = gamma_np[:, 1, 1].reshape(self.config.resolution, self.config.resolution)
-        gamma_12 = gamma_np[:, 0, 1].reshape(self.config.resolution, self.config.resolution)
-        
-        ax4 = fig.add_subplot(gs[1, 0])
-        im4 = ax4.contourf(X, Y, gamma_11, levels=20, cmap='plasma')
-        ax4.set_title('Spatial Metric γ₁₁', fontsize=14, fontweight='bold')
-        ax4.set_xlabel('x', fontsize=12)
-        ax4.set_ylabel('y', fontsize=12)
-        plt.colorbar(im4, ax=ax4)
-        
-        ax5 = fig.add_subplot(gs[1, 1])
-        im5 = ax5.contourf(X, Y, gamma_22, levels=20, cmap='plasma')
-        ax5.set_title('Spatial Metric γ₂₂', fontsize=14, fontweight='bold')
-        ax5.set_xlabel('x', fontsize=12)
-        ax5.set_ylabel('y', fontsize=12)
-        plt.colorbar(im5, ax=ax5)
-        
-        ax6 = fig.add_subplot(gs[1, 2])
-        im6 = ax6.contourf(X, Y, gamma_12, levels=20, cmap='RdBu_r', vmin=-np.abs(gamma_12).max(), vmax=np.abs(gamma_12).max())
-        ax6.set_title('Spatial Metric γ₁₂', fontsize=14, fontweight='bold')
-        ax6.set_xlabel('x', fontsize=12)
-        ax6.set_ylabel('y', fontsize=12)
-        plt.colorbar(im6, ax=ax6)
-        
-        plt.suptitle('ADM Fields (z=0 slice)', fontsize=16, fontweight='bold', y=0.98)
-        
-        if self.config.save_plots:
-            plt.savefig(filename, dpi=self.config.dpi, bbox_inches='tight')
-            print(f"Saved ADM fields to {filename}")
-        
-        plt.close()
-    
-    def plot_metric_3d(self, solver: ADMSolver, filename: str = "metric_3d.png"):
-        """3D visualization of metric components."""
-        # Create coordinate grid
-        n = 30
-        x = np.linspace(-self.config.spatial_extent/2, self.config.spatial_extent/2, n)
-        y = np.linspace(-self.config.spatial_extent/2, self.config.spatial_extent/2, n)
-        X, Y = np.meshgrid(x, y)
-        
-        coords = torch.zeros(n ** 2, 4)
-        coords[:, 0] = 0.0
-        coords[:, 1] = torch.from_numpy(X.flatten())
-        coords[:, 2] = torch.from_numpy(Y.flatten())
-        coords[:, 3] = 0.0
-        
-        results = solver.predict(coords)
-        lapse = results['lapse'].numpy().reshape(n, n)
-        
-        # Create 3D plot
-        fig = plt.figure(figsize=(14, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        surf = ax.plot_surface(X, Y, lapse, cmap='viridis', 
-                              edgecolor='none', alpha=0.9)
-        
-        ax.set_xlabel('X', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Y', fontsize=12, fontweight='bold')
-        ax.set_zlabel('Lapse α', fontsize=12, fontweight='bold')
-        ax.set_title('3D Lapse Function', fontsize=16, fontweight='bold', pad=20)
-        
-        plt.colorbar(surf, ax=ax, shrink=0.5, aspect=5)
-        
-        if self.config.save_plots:
-            plt.savefig(filename, dpi=self.config.dpi, bbox_inches='tight')
-            print(f"Saved 3D metric to {filename}")
-        
-        plt.close()
-    
-    def plot_breakthrough_analysis(self, detector: BreakthroughDetector, 
-                                   filename: str = "breakthrough_analysis.png"):
-        """Visualize breakthrough detection results."""
-        if not detector.breakthroughs:
-            print("No breakthroughs detected to visualize.")
-            return
-        
-        fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
-        
-        # History of metrics
-        ax1 = fig.add_subplot(gs[0, 0])
-        epochs = range(len(detector.history['constraint_violation']))
-        ax1.plot(epochs, detector.history['constraint_violation'], 'b-', linewidth=2, label='Constraint Violation')
-        
-        # Mark breakthroughs
-        for bt in detector.breakthroughs:
-            ax1.axvline(x=bt['epoch'], color='r', linestyle='--', alpha=0.7)
-        
-        ax1.set_xlabel('Check Point', fontsize=12)
-        ax1.set_ylabel('Constraint Violation', fontsize=12)
-        ax1.set_title('Constraint Evolution with Breakthroughs', fontsize=14, fontweight='bold')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Curvature evolution
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.plot(epochs, detector.history['curvature_max'], 'g-', linewidth=2, label='Max Curvature')
-        for bt in detector.breakthroughs:
-            ax2.axvline(x=bt['epoch'], color='r', linestyle='--', alpha=0.7)
-        ax2.set_xlabel('Check Point', fontsize=12)
-        ax2.set_ylabel('Maximum Curvature', fontsize=12)
-        ax2.set_title('Curvature Evolution', fontsize=14, fontweight='bold')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # Breakthrough summary
-        ax3 = fig.add_subplot(gs[1, :])
-        ax3.axis('off')
-        
-        summary_text = f"BREAKTHROUGH SUMMARY\n{'='*60}\n\n"
-        summary_text += f"Total Breakthroughs Detected: {len(detector.breakthroughs)}\n\n"
-        
-        for i, bt in enumerate(detector.breakthroughs[:5], 1):  # Show first 5
-            summary_text += f"Breakthrough #{i} (Epoch {bt['epoch']}):\n"
-            for reason in bt['reasons']:
-                summary_text += f"  • {reason}\n"
-            summary_text += f"  Metrics: Constraint={bt['metrics']['constraint_violation']:.6f}, "
-            summary_text += f"Curvature={bt['metrics']['curvature_max']:.6f}\n\n"
-        
-        ax3.text(0.1, 0.9, summary_text, transform=ax3.transAxes, 
-                fontsize=11, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-        
-        plt.suptitle('Breakthrough Detection Analysis', fontsize=16, fontweight='bold', y=0.98)
-        
-        if self.config.save_plots:
-            plt.savefig(filename, dpi=self.config.dpi, bbox_inches='tight')
-            print(f"Saved breakthrough analysis to {filename}")
-        
-        plt.close()
-    
-    def create_comprehensive_report(self, solver: ADMSolver, 
-                                   history: Dict[str, List[float]],
-                                   detector: BreakthroughDetector):
-        """Generate all visualizations and reports."""
-        print("\nGenerating comprehensive visualization report...")
-        
-        self.plot_training_history(history, "training_history.png")
-        self.plot_adm_fields(solver, "adm_fields.png")
-        self.plot_metric_3d(solver, "metric_3d.png")
-        
-        if detector.breakthroughs:
-            self.plot_breakthrough_analysis(detector, "breakthrough_analysis.png")
-        
-        print("Visualization report complete!\n")
-
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
-def main():
-    """Main execution function."""
-    print("\n" + "="*80)
-    print(" "*20 + "3+1 ADM PINN SOLVER")
-    print(" "*15 + "Einstein Field Equations Solver")
-    print("="*80 + "\n")
-    
-    # Configuration
-    network_config = NetworkConfig(
-        hidden_dim=256,
-        num_layers=6,
-        activation="sine",
-        omega_0=30.0,
-        use_fourier=True,
-        fourier_scale=10.0,
-        num_fourier=128
-    )
-    
-    adm_config = ADMConfig(
-        enforce_hamiltonian=True,
-        enforce_momentum=True,
-        gauge_condition="maximal_slicing",
-        hamiltonian_weight=10.0,
-        momentum_weight=5.0,
-        gauge_weight=1.0
-    )
-    
-    training_config = TrainingConfig(
-        epochs=500,
-        batch_size=512,
-        lr_initial=1e-4,
-        curriculum_stages=5,
-        adaptive_sampling=True
-    )
-    
-    breakthrough_config = BreakthroughConfig(
-        enabled=True,
-        novelty_threshold=2.5,
-        check_every=10
-    )
-    
-    viz_config = VisualizationConfig(
-        resolution=50,
-        spatial_extent=20.0,
-        save_plots=True,
-        dpi=150
-    )
-    
-    # Create matter field (scalar field example)
-    print("Initializing scalar field matter...")
-    matter = ScalarField(network_config, mass=1.0, potential_type="quadratic")
-    
-    # Create solver
-    print("Initializing ADM solver...")
-    solver = ADMSolver(
-        network_config=network_config,
-        adm_config=adm_config,
-        training_config=training_config,
-        breakthrough_config=breakthrough_config,
-        matter=matter
-    )
-    
-    # Train
-    print("\nBeginning training...\n")
-    history = solver.train()
-    
-    # Visualize
-    print("\nCreating visualizations...")
-    visualizer = ADMVisualizer(viz_config)
-    visualizer.create_comprehensive_report(
-        solver, 
-        history, 
-        solver.breakthrough_detector
-    )
-    
-    # Final summary
-    print("\n" + "="*80)
-    print("TRAINING COMPLETE")
-    print("="*80)
-    print(f"Final loss: {solver.best_loss:.6e}")
-    print(f"Breakthroughs detected: {len(solver.breakthrough_detector.breakthroughs)}")
-    print(f"Generated visualizations:")
-    print("  • training_history.png - Training loss curves")
-    print("  • adm_fields.png - ADM field visualizations")
-    print("  • metric_3d.png - 3D metric visualization")
-    if solver.breakthrough_detector.breakthroughs:
-        print("  • breakthrough_analysis.png - Breakthrough detection results")
-    print("="*80 + "\n")
-    
-    return solver, history
-
-
+# --- Main Execution ---
 if __name__ == "__main__":
-    # Run the solver
-    solver, history = main()
+    config = HyperParameters()
+    config.epochs = 400 
     
-    print("Solver ready for analysis!")
-    print("You can now:")
-    print("  1. Examine solver.breakthrough_detector.breakthroughs for novel solutions")
-    print("  2. Use solver.predict(coords) to evaluate at new points")
-    print("  3. Analyze the generated plots for physical insights")
-    print("\nThank you for using the 3+1 ADM PINN Solver!")
+    runner = ExperimentRunner()
+    
+    # Run Active Discovery for Warp Bubbles
+    dataset = runner.run_active_discovery(config, mode="warp_bubble", n_rounds=5, batch_size=1)
+    
+    ranked_df = rank_solutions(dataset)
+    
+    # Visualize Best
+    if not ranked_df.empty:
+        best_id = ranked_df.iloc[0]['id']
+        best_entry = next(item for item in dataset if item["id"] == best_id)
+        visualize_entry(best_entry)
